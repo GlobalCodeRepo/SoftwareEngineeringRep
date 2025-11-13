@@ -7,9 +7,11 @@ import uuid
 import time
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
+from openai import AzureOpenAI
+from dotenv import load_dotenv
 from unittest import TestCase, main
 
-# --- NEW PRESIDIO IMPORTS ---
+# --- PRESIDIO IMPORTS ---
 try:
     from presidio_analyzer import AnalyzerEngine
     from presidio_anonymizer import AnonymizerEngine
@@ -29,7 +31,7 @@ except ImportError:
 # --- END PRESIDIO IMPORTS ---
 
 
-# --- 1. CONFIGURATION AND CORE LOGIC (UNCHANGED) ---
+# --- 1. CONFIGURATION AND CORE LOGIC ---
 # ... (CATEGORY_MAP, THRESHOLD_T, CATEGORY_SCHEMA remain the same)
 CATEGORY_MAP = {
     "Market Manipulation/Misconduct": {"f1": 4, "f2": 4, "tier": "H"},
@@ -528,7 +530,7 @@ def main():
         st.session_state.api_client = None
     else:
         try:
-            st.session_state.api_client = OpenAI(api_key=api_key)
+            st.session_state.api_client = AzureOpenAI(api_version = os.getenv("API_VERSION"),azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"),api_key= os.getenv("AZURE_OPENAI_API_KEY"))
             st.sidebar.success("OpenAI Client Initialized (GPT-4o)")
         except Exception as e:
              st.sidebar.error(f"Failed to initialize OpenAI Client: {e}")
@@ -579,6 +581,7 @@ def main():
         st.sidebar.dataframe(log_df, use_container_width=True, hide_index=True)
 
 if __name__ == '__main__':
+    load_dotenv()
     import sys
     sys.setrecursionlimit(2000) 
     main()
