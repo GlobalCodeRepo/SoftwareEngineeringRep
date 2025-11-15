@@ -5,7 +5,12 @@ import json
 import math
 import uuid
 import time
-from concurrent.futures import ThreadPoolExecutor
+from presidio_anonymizer import AnonymizerEngine
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer.operators import Replace
+from presidio_anonymizer.entities import OperatorConfig
+PRESIDIO_AVAILABLE = True
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from openai import AzureOpenAI
 from dotenv import load_dotenv
@@ -77,11 +82,13 @@ def simulate_db_log_action(email_id, action, details):
     }
     st.session_state.audit_logs.append(log_entry)
     print(f"DB AUDIT LOG: {email_id[:8]} | Action: {action} | Details: {details.get('status')}")
+    return log_entry
 
 def simulate_db_store_processed_email(email_data):
     # ... (Implementation remains the same)
-    st.session_state.processed_emails.append(email_data)
+    #st.session_state.processed_emails.append(email_data)
     print(f"DB WRITE: Email {email_data['id'][:8]} written to ProcessedEmails (P-Score: {email_data['p_score']})")
+    return email_data
 
 
 # --- CORE LOGIC FUNCTIONS (P-SCORE UNCHANGED) ---
@@ -169,7 +176,7 @@ def mask_pii_with_presidio(email_body):
     return masked_body, pii_map
 
 # The wrapper function is renamed and updated to use the new module
-def classify_email_llm(email_data, client: OpenAI):
+def classify_email_llm(email_data, client: AzureOpenAI):
     """Calls the OpenAI API to classify a single masked email (MUST BE THREAD-SAFE)."""
     # ... (Implementation remains the same)
     email_id = email_data['id']
@@ -190,7 +197,7 @@ def classify_email_llm(email_data, client: OpenAI):
     
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=os.getenv("AZURE_DEPLOYMENT"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -216,30 +223,54 @@ def classify_email_llm(email_data, client: OpenAI):
         )
         return []
 
-def process_single_email_pipeline(email_data_dict, client: OpenAI):
+def process_single_email_pipeline(email_data_dict, client: AzureOpenAI):
     """
     Executes the full security, classification, and scoring pipeline for one email.
+    FIXED: Ensures all required keys are initialized for DataFrame creation.
     """
-    # Step 2: PII Encryption/Masking (Using Presidio or Fallback)
-    masked_body, pii_map = mask_pii_with_presidio(email_data_dict['body']) # RENAME USED HERE
-    email_data_dict['masked_body'] = masked_body
-    email_data_dict['pii_map'] = pii_map
-
-    # Step 3: Parallel Classification (LLM API Call)
-    findings = classify_email_llm(email_data_dict, client)
-
-    # ... (Steps 4 & 5 remain the same)
-    p_score = calculate_p_score(findings)
+    email_id = email_data_dict['id']
     
-    email_data_dict['categories'] = findings
-    email_data_dict['p_score'] = p_score
-    email_data_dict['categories_summary'] = ", ".join(f['category'] for f in findings) if findings else "CLEAN"
-    email_data_dict['reviewer_action'] = 'PENDING'
+    # Initialize required keys to safe defaults immediately
+    email_data_dict['masked_body'] = email_data_dict.get('masked_body', email_data_dict['body'])
+    email_data_dict['pii_map'] = email_data_dict.get('pii_map', {})
+    email_data_dict['categories'] = email_data_dict.get('categories', [])
+    email_data_dict['p_score'] = email_data_dict.get('p_score', 0.0)
+    email_data_dict['categories_summary'] = email_data_dict.get('categories_summary', "PROCESSING FAILED")
+    email_data_dict['reviewer_action'] = email_data_dict.get('reviewer_action', 'PENDING')
 
-    simulate_db_store_processed_email(email_data_dict)
-    
-    return email_data_dict
+    try:
+        # Step 2: PII Encryption/Masking (Using Presidio or Fallback)
+        masked_body, pii_map = mask_pii_with_presidio(email_data_dict['body'])
+        email_data_dict['masked_body'] = masked_body
+        email_data_dict['pii_map'] = pii_map
 
+        # Step 3: Parallel Classification (LLM API Call)
+        # We assume classify_email_llm handles its own API exceptions 
+        # but returns [] if an error occurs.
+        findings = classify_email_llm(email_data_dict, client)
+
+        # Step 4: Calculate P-Score
+        p_score = calculate_p_score(findings)
+        
+        # Step 5: Finalize Data Structure
+        email_data_dict['categories'] = findings
+        email_data_dict['p_score'] = p_score
+        email_data_dict['categories_summary'] = ", ".join(f['category'] for f in findings) if findings else "CLEAN"
+        email_data_dict['reviewer_action'] = 'PENDING'
+
+    except Exception as e:
+        # Catch any unexpected errors during PII masking or processing setup
+        email_data_dict['categories'] = []
+        email_data_dict['p_score'] = 0.0
+        email_data_dict['categories_summary'] = f"CRASH: {str(e)[:40]}..."
+        email_data_dict['reviewer_action'] = 'ERROR'
+        # Log the failure using the thread-safe print function
+        print(f"THREAD EXCEPTION for {email_id[:8]}: {e}")
+
+    # FIX: We now return the dictionary. The main thread will update st.session_state 
+    # with this data, which resolves the threading issue.
+    # We call the modified (thread-safe) simulation function, which no longer touches st.session_state.
+    return simulate_db_store_processed_email(email_data_dict)
 
 # --- REST OF THE CODE (UI/TESTS/MAIN) REMAINS THE SAME ---
 
@@ -317,24 +348,37 @@ def process_email_batch(uploaded_files, max_workers=5):
 
     if not emails_to_process:
         return
-        
+
+    # Temporary lists to collect results and logs from threads
+    final_processed_email = []
+    batch_audit_logs = []
+    
     with st.status("Processing emails in parallel...", expanded=True) as status:
         st.write(f"Starting parallel classification for {len(emails_to_process)} emails (Max workers: {max_workers})...")
         
         # 2. Start Parallel Execution (The Looper)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all jobs
-            futures = [executor.submit(process_single_email_pipeline, email_data, client) 
-                       for email_data in emails_to_process]
+            future_to_email = {
+                executor.submit(process_single_email_pipeline, email_data, client): email_data['id']
+                       for email_data in emails_to_process
             
-            for i, future in enumerate(futures):
+            for i, future in enumerate(as_completed(future_to_email):
                 try:
-                    future.result() 
+                    result = future.result()
+                    final_processed_emails.append(result)
                     status.update(label=f"Classifying: {i+1}/{len(emails_to_process)} emails complete.")
                 except Exception as e:
-                    st.error(f"A processing thread failed: {e}")
-                    simulate_db_log_action('N/A', 'PARALLEL_FAIL', {'error': str(e), 'index': i})
-                    
+                    email_id = future_to_email.get(future, 'N/A')
+                    st.error(f"A processing thread failed for Email ID[:8]): {e}")
+                    st.session_state.audit_logs.append({
+                        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "email_id": email_id,
+                        "action": 'PARALLEL_FAIL',
+                        "details": {'error': str(e)},
+                    })
+                        
+         st.session_state.processed_emails = final_processed_emails           
         # Sort results by P-Score (Highest Priority First)
         st.session_state.processed_emails.sort(key=lambda x: x.get('p_score', 0), reverse=True)
 
@@ -517,7 +561,7 @@ def run_tests():
 def main():
     """Sets up the Streamlit UI and handles the main workflow."""
     st.set_page_config(layout="wide", page_title="AI Communication Surveillance")
-    init_session_state()
+    #init_session_state()
     
     # Sidebar
     st.sidebar.title("System Status")
@@ -584,4 +628,5 @@ if __name__ == '__main__':
     load_dotenv()
     import sys
     sys.setrecursionlimit(2000) 
+    init_session_state()
     main()
