@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple
+from openai import AzureOpenAI
 
 import streamlit as st
 
@@ -155,9 +156,9 @@ def mask_pii(text: str) -> Tuple[str, List[Dict[str,Any]]]:
 def init_azure_client():
     if not AZURE_OPENAI_AVAILABLE:
         return None
-    key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY")
+    key = os.getenv("AZURE_OPENAI_API_KEY")
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+    api_version = os.getenv("API_VERSION")
     if not key or not endpoint:
         return None
     try:
@@ -196,14 +197,17 @@ def validate_llm_output(obj: Any) -> Tuple[bool, str]:
         if "category" not in c or "sourceline_quotes" not in c or "reason" not in c:
             return False, "each category entry must contain category, sourceline_quotes and reason"
         if c.get("category") not in ALLOWED_CATEGORIES:
-            return False, f\"Category '{c.get('category')}' not in allowed list\"
+            return False, f\"Category '{c.get('category')}' not in allowed list"
     return True, "OK"
 
 def call_azure_llm(client, email_obj: Dict[str,Any], categories_list: List[str]) -> Dict[str,Any]:
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_MODEL")
     if not deployment:
         raise RuntimeError("Azure deployment/model env var not set (AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_MODEL)")
-    email_text = f\"Subject: {email_obj.get('subject','')}\\nBody:\\n{email_obj.get('body','')}\"
+    email_text = f"""Subject: {email_obj.get('subject','')}
+    Body:
+    {email_obj.get('body','')}
+   ) """
     prompt = LLM_PROMPT_TEMPLATE.format(categories_list=", ".join(categories_list), email_text=email_text)
     resp = client.chat.completions.create(
         model=deployment,
@@ -389,7 +393,7 @@ def handle_reviewer_action(identifier: str, category: str, action_label: str):
             }
             add_reviewer_feedback(fb)
             simulate_db_log_action(identifier, "REVIEWER_ACTION", fb)
-            st.experimental_rerun()
+            st.rerun()
             break
 
 def export_reviewer_feedback_download():
