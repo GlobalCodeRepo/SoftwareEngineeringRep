@@ -17,9 +17,8 @@ except ImportError:
     st.error("The 'openai' library is not installed. Please run: pip install openai")
     AzureOpenAI = None 
 
-# --- PRESIDIO IMPORTS (CLEANED) ---
+# --- PRESIDIO IMPORTS ---
 try:
-    # Use explicit imports only from the known correct packages
     from presidio_analyzer import AnalyzerEngine
     from presidio_anonymizer import AnonymizerEngine
     from presidio_anonymizer.operators import Replace
@@ -27,13 +26,10 @@ try:
     PRESIDIO_AVAILABLE = True
 except ImportError:
     PRESIDIO_AVAILABLE = False
-    # Mock classes to prevent runtime errors if library is missing
     class MockAnalyzerEngine:
-        def analyze(self, *args, **kwargs):
-            return []
+        def analyze(self, *args, **kwargs): return []
     class MockAnonymizerEngine:
-        def anonymize(self, text, *args, **kwargs):
-            return text
+        def anonymize(self, text, *args, **kwargs): return text
     AnalyzerEngine = MockAnalyzerEngine
     AnonymizerEngine = MockAnonymizerEngine
     OperatorConfig = object 
@@ -150,7 +146,6 @@ def mask_pii_with_presidio(email_body):
         entities=["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS", "DATE", "CREDIT_CARD", "US_DRIVER_LICENSE"],
         language='en'
     )
-    # FIX: Correct configuration for the replace operator using string literal
     anonymized_results = anonymizer.anonymize(
         text=email_body,
         analyzer_results=results,
@@ -174,7 +169,8 @@ def classify_email_llm(email_data, client: AzureOpenAI):
     system_prompt = (
         "You are a world-class Financial Communication Surveillance Analyst. Your task is to review the following masked email and identify ALL instances of non-compliance "
         f"related to the following financial categories: {list(CATEGORY_MAP.keys())}. "
-        "You MUST respond ONLY with a JSON array that strictly adheres to the provided schema. If the email is fully compliant, return an empty JSON array []."
+        "You MUST respond ONLY with a JSON array that strictly adheres to the provided schema. If the email is fully compliant, return an empty JSON array []. "
+        "For each finding, you must quote the exact 'sourceline' and provide a concise 'reason'."
     )
     user_prompt = f"Analyze the communication:\n\n{masked_body}"
     
@@ -185,6 +181,7 @@ def classify_email_llm(email_data, client: AzureOpenAI):
             response_format={"type": "json_object", "schema": CATEGORY_SCHEMA},
             temperature=0.0
         )
+        
         findings_json = response.choices[0].message.content
         parsed_data = json.loads(findings_json)
         findings = parsed_data.get('array', parsed_data) if isinstance(parsed_data, dict) else parsed_data
@@ -340,36 +337,41 @@ def process_email_batch(uploaded_files, max_workers=5):
 
 def render_prioritization_queue():
     """Renders the main alert queue (DataFrame)."""
+    # 1. Check if the list is empty (initial state)
     if not st.session_state.processed_emails:
         st.info("Upload emails to start the surveillance pipeline.")
         return
     
-    # CRITICAL FIX: Ensure ALL items are dictionaries before creating DataFrame
+    # 2. Filter the list to ensure only valid dictionaries are used (CRITICAL)
     clean_processed_emails = [
         email_dict for email_dict in st.session_state.processed_emails 
-        if isinstance(email_dict, dict)
+        if isinstance(email_dict, dict) and email_dict.get('id') is not None
     ]
     
+    # 3. Check if all items were filtered out (all items failed/were corrupt)
     if not clean_processed_emails:
-        st.warning("All processed results were invalid. Please check logs for errors.")
+        st.warning("All processed results failed or were invalid. Please check logs for errors.")
         return
         
+    # 4. DataFrame creation (Now guaranteed to be from valid dictionaries)
     emails_df = pd.DataFrame(clean_processed_emails)
     
     display_cols = ['p_score', 'subject', 'filename', 'categories_summary', 'reviewer_action', 'id']
     
-    # Final check for missing columns (should be redundant now, but good defense)
+    # Final check for missing columns (should be safe now due to defensive coding in threads)
     missing_cols = [col for col in display_cols if col not in emails_df.columns]
     if missing_cols:
-        st.error(f"Internal Data Error: Missing columns {missing_cols} in DataFrame source. Check thread processing stability.")
+        st.error(f"Internal Data Error: Missing columns {missing_cols}. This should not happen. Check thread logic.")
         return
 
+    # 5. Rename and select columns (This is where the KeyError was happening)
     emails_df = emails_df.rename(columns={
         'p_score': 'P-Score', 
         'categories_summary': 'Findings',
         'reviewer_action': 'Action Status'
     })[display_cols].copy()
     
+    # ... rest of the function for display ...
     def color_score(val):
         if val >= 20: return 'background-color: #F87171; color: white'
         if val >= 10: return 'background-color: #FBBF24'
@@ -378,8 +380,8 @@ def render_prioritization_queue():
 
     def select_row(selection):
         if selection and selection['selection']:
-            # We must use the index relative to the *clean* list for look-up
             selected_index = selection['selection'][0]
+            # Use the index relative to the *clean* list for look-up
             original_row = clean_processed_emails[selected_index]
             st.session_state.selected_email_id = original_row['id']
             st.rerun()
@@ -409,7 +411,7 @@ def render_prioritization_queue():
     )
 
 def render_details_pane():
-    """Renders the right-hand panel with evidence and audit controls."""
+    # ... (function body remains the same)
     if not st.session_state.selected_email_id:
         st.info("Select an email from the queue to view detailed analysis and evidence.")
         return
@@ -564,4 +566,4 @@ if __name__ == '__main__':
     import sys
     sys.setrecursionlimit(2000) 
     init_session_state() 
-    main()
+    main()            
