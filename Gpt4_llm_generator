@@ -361,11 +361,23 @@ def simulate_db_log_action(identifier: str, action: str, meta: Dict[str,Any]):
         st.session_state.audit_logs = []
     st.session_state.audit_logs.append({"id": identifier, "action": action, "meta": meta, "ts": time.time()})
 
-def add_reviewer_feedback(item: Dict[str,Any]):
-    if "reviewer_feedback" not in st.session_state:
+def add_reviewer_feedback(item):
+    if 'reviewer_feedback' not in st.session_state:
         st.session_state.reviewer_feedback = []
-    st.session_state.reviewer_feedback.append(item)
-    # persist rolling file
+
+    # Check if this category for this email already exists
+    updated = False
+    for fb in st.session_state.reviewer_feedback:
+        if fb["Identifier"] == item["Identifier"] and fb["category"] == item["category"]:
+            fb["action"] = item["action"]        # update instead of duplicate
+            fb["timestamp"] = item["timestamp"]  # refresh timestamp
+            updated = True
+            break
+
+    if not updated:
+        st.session_state.reviewer_feedback.append(item)
+
+    # Save updated list
     p = FEEDBACK_DIR / "reviewer_feedback.json"
     with open(p, "w", encoding="utf-8") as f:
         json.dump(st.session_state.reviewer_feedback, f, ensure_ascii=False, indent=2)
