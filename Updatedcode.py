@@ -6,19 +6,18 @@ import math
 import uuid
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from unittest import TestCase, main
+from unittest import TestCase, main, TestLoader, TextTestRunner # Added TestLoader/TextTestRunner
+from io import StringIO # Use StringIO for test output capturing
 from dotenv import load_dotenv
 
 # --- LLM Client Imports and Setup ---
-# Using AzureOpenAI for enterprise compliance
 try:
     from openai import AzureOpenAI
 except ImportError:
     st.error("The 'openai' library is not installed. Please run: pip install openai")
-    AzureOpenAI = None # Define a safe fallback
+    AzureOpenAI = None 
 
 # --- PRESIDIO IMPORTS ---
-# We use try/except block for a clean fallback in case Presidio is not installed.
 try:
     from presidio_analyzer import AnalyzerEngine
     from presidio_anonymizer import AnonymizerEngine
@@ -27,82 +26,19 @@ try:
     PRESIDIO_AVAILABLE = True
 except ImportError:
     PRESIDIO_AVAILABLE = False
-    # Mock classes to prevent runtime errors if library is missing
     class MockAnalyzerEngine:
-        def analyze(self, *args, **kwargs):
-            return []
+        def analyze(self, *args, **kwargs): return []
     class MockAnonymizerEngine:
-        def anonymize(self, text, *args, **kwargs):
-            return text
+        def anonymize(self, text, *args, **kwargs): return text
     AnalyzerEngine = MockAnalyzerEngine
     AnonymizerEngine = MockAnonymizerEngine
-    OperatorConfig = object # Define a safe type
+    OperatorConfig = object 
 
-# --- 1. CONFIGURATION AND CORE LOGIC ---
-
-# 1. Priority Matrix Configuration (Based on your categories)
-CATEGORY_MAP = {
-    "Market Manipulation/Misconduct": {"f1": 4, "f2": 4, "tier": "H"}, # High Risk, High Impact/Likelihood
-    "Market Bribery":                 {"f1": 4, "f2": 4, "tier": "H"},
-    "Secrecy":                        {"f1": 3, "f2": 2, "tier": "U"}, # Unknown/Need Investigation
-    "Change in communication":        {"f1": 3, "f2": 2, "tier": "U"},
-    "Employee ethics":                {"f1": 1, "f2": 4, "tier": "M"}, # Medium Risk, High Impact
-    "Complaints":                     {"f1": 2, "f2": 1, "tier": "L"}, # Low Risk, Low Impact
-}
-THRESHOLD_T = 10 # Bias factor for prioritization
-
-# 2. JSON Schema for LLM Structured Output
-CATEGORY_SCHEMA = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "properties": {
-            "category": {
-                "type": "string",
-                "enum": list(CATEGORY_MAP.keys()),
-                "description": "The specific non-compliant category identified in the text.",
-            },
-            "sourceline": {
-                "type": "string",
-                "description": "The exact sentence or phrase from the email body that triggers the non-compliance alert. Must be a direct quote.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "A concise explanation of why this source line is non-compliant under this category.",
-            },
-        },
-        "required": ["category", "sourceline", "reason"],
-    },
-}
-
-# --- DATABASE PERSISTENCE (THREAD-SAFE SIMULATION) ---
-# FIX: These functions no longer touch st.session_state directly to avoid thread crashes.
-# They only return data/log entries or print for auditing.
-
-def simulate_db_log_action(email_id, action, details):
-    """Generates an audit log entry (for printing in the thread)."""
-    log_entry = {
-        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "email_id": email_id,
-        "action": action,
-        "details": details.get('status', str(details)),
-    }
-    # This print is safe because it's non-Streamlit I/O
-    print(f"DB AUDIT LOG: {email_id[:8]} | Action: {action} | Details: {details.get('status', 'N/A')}")
-    return log_entry
-
-
-def simulate_db_store_processed_email(email_data):
-    """Simulates storing the final processed email data."""
-    # This print is safe because it's non-Streamlit I/O
-    print(f"DB WRITE: Email {email_data['id'][:8]} ready for final storage. P-Score: {email_data['p_score']:.2f}")
-    return email_data # Return the data to the main thread for state update
-
-
-# --- CORE LOGIC FUNCTIONS ---
+# --- CORE LOGIC FUNCTION: P-Score Calculation ---
 
 def calculate_p_score(categories):
     """Calculates the P-Score based on the non-compliance matrix formula."""
+    # (Copy the original calculate_p_score function here)
     if not categories:
         return 0.0
 
@@ -128,6 +64,103 @@ def calculate_p_score(categories):
     p_score = math.ceil(average_product + b)
     return float(p_score)
 
+# --- 3. UNIT TESTING (MOVED TO TOP TO RESOLVE NameError) ---
+
+class TestPrioritizationLogic(TestCase):
+    """Tests the Bias-Based P-Score calculation logic."""
+
+    def test_high_tier_bias(self):
+        categories = [{'category': 'Market Manipulation/Misconduct'}, {'category': 'Complaints'}]
+        # (16 + 2) / 2 = 9. Bias +10. P = 19.0
+        self.assertEqual(calculate_p_score(categories), 19.0)
+
+    def test_unknown_tier_bias(self):
+        categories = [{'category': 'Secrecy'}, {'category': 'Complaints'}]
+        # (6 + 2) / 2 = 4. Bias +10. P = 14.0
+        self.assertEqual(calculate_p_score(categories), 14.0)
+
+    def test_low_tier_only(self):
+        categories = [{'category': 'Complaints'}, {'category': 'Complaints'}]
+        # (2 + 2) / 2 = 2. Bias: 2 * 10 = 20. P = 22.0 (FIXED: Uses the count of L)
+        self.assertEqual(calculate_p_score(categories), 22.0)
+        
+    def test_medium_tier_only(self):
+        categories = [{'category': 'Employee ethics'}]
+        # 4 / 1 = 4. Bias +10. P = 14.0
+        self.assertEqual(calculate_p_score(categories), 14.0)
+        
+
+def run_tests():
+    """Runs unit tests and displays results in Streamlit."""
+    # Capture output using StringIO (similar to BytesIO for text output)
+    stream = StringIO()
+    loader = TestLoader()
+    suite = loader.loadTestsFromTestCase(TestPrioritizationLogic)
+    runner = TextTestRunner(stream=stream, verbosity=2)
+    result = runner.run(suite)
+    
+    test_output = stream.getvalue()
+    
+    summary = f"Tests Run: {result.testsRun}, Failures: {len(result.failures)}, Errors: {len(result.errors)}"
+    
+    return summary, test_output
+
+# --- 1. CONFIGURATION AND CORE LOGIC ---
+
+CATEGORY_MAP = {
+    "Market Manipulation/Misconduct": {"f1": 4, "f2": 4, "tier": "H"},
+    "Market Bribery":                 {"f1": 4, "f2": 4, "tier": "H"},
+    "Change in communication":        {"f1": 3, "f2": 2, "tier": "U"},
+    "Secrecy":                        {"f1": 3, "f2": 2, "tier": "U"},
+    "Employee ethics":                {"f1": 1, "f2": 4, "tier": "M"},
+    "Complaints":                     {"f1": 2, "f2": 1, "tier": "L"},
+}
+THRESHOLD_T = 10
+
+CATEGORY_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": list(CATEGORY_MAP.keys()),
+                "description": "The specific non-compliant category identified in the text.",
+            },
+            "sourceline": {
+                "type": "string",
+                "description": "The exact sentence or phrase from the email body that triggers the non-compliance alert. Must be a direct quote.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "A concise explanation of why this source line is non-compliant under this category.",
+            },
+        },
+        "required": ["category", "sourceline", "reason"],
+    },
+}
+
+# --- DATABASE PERSISTENCE (THREAD-SAFE SIMULATION) ---
+
+def simulate_db_log_action(email_id, action, details):
+    """Generates an audit log entry (for printing in the thread)."""
+    log_entry = {
+        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "email_id": email_id,
+        "action": action,
+        "details": details.get('status', str(details)),
+    }
+    print(f"DB AUDIT LOG: {email_id[:8]} | Action: {action} | Details: {details.get('status', 'N/A')}")
+    return log_entry
+
+
+def simulate_db_store_processed_email(email_data):
+    """Simulates storing the final processed email data."""
+    print(f"DB WRITE: Email {email_data['id'][:8]} ready for final storage. P-Score: {email_data['p_score']:.2f}")
+    return email_data 
+
+
+# --- PII MASKING ---
 
 def mask_pii_with_presidio(email_body):
     """Uses Presidio for PII masking (Tokenization)."""
@@ -144,7 +177,7 @@ def mask_pii_with_presidio(email_body):
             masked_body = masked_body.replace(original, token)
         return masked_body, pii_map
     
-    # --- PRESIDIO CORE LOGIC (FIXED) ---
+    # --- PRESIDIO CORE LOGIC ---
     analyzer = AnalyzerEngine()
     anonymizer = AnonymizerEngine()
 
@@ -154,7 +187,7 @@ def mask_pii_with_presidio(email_body):
         language='en'
     )
     
-    # FIX: Use OperatorConfig with the string literal "replace" to avoid operator class errors
+    # FIX: Use OperatorConfig with the string literal "replace" 
     anonymized_results = anonymizer.anonymize(
         text=email_body,
         analyzer_results=results,
@@ -166,19 +199,21 @@ def mask_pii_with_presidio(email_body):
     # Simple PII map creation
     for res in results:
         entity_text = email_body[res.start:res.end]
-        pii_map[f"<[[{res.entity_type}]]>"] = entity_text # Mock token map
+        pii_map[f"<[[{res.entity_type}]]>"] = entity_text 
         
     return masked_body, pii_map
 
+
+# --- LLM CLASSIFICATION (THREAD-SAFE) ---
 
 def classify_email_llm(email_data, client: AzureOpenAI):
     """Calls the Azure OpenAI API to classify a single masked email (THREAD-SAFE)."""
     email_id = email_data['id']
     masked_body = email_data['masked_body']
     
-    # FIX: Use environment variable for Azure Deployment ID
     deployment_id = os.getenv("AZURE_DEPLOYMENT_ID") 
     if not deployment_id:
+        # If ID is missing, we must fail with a meaningful error
         raise ValueError("AZURE_DEPLOYMENT_ID environment variable not set.")
     
     system_prompt = (
@@ -201,7 +236,6 @@ def classify_email_llm(email_data, client: AzureOpenAI):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            # Ensure the Azure API version supports response_format for structured output
             response_format={"type": "json_object", "schema": CATEGORY_SCHEMA},
             temperature=0.0
         )
@@ -209,7 +243,6 @@ def classify_email_llm(email_data, client: AzureOpenAI):
         findings_json = response.choices[0].message.content
         
         parsed_data = json.loads(findings_json)
-        # Handle common LLM wrapping issues
         findings = parsed_data.get('array', parsed_data) if isinstance(parsed_data, dict) else parsed_data
         
         simulate_db_log_action(
@@ -218,11 +251,11 @@ def classify_email_llm(email_data, client: AzureOpenAI):
         return findings
 
     except Exception as e:
+        # LLM API FAILURE PATH
         simulate_db_log_action(
             email_id=email_id, action='CLASSIFIED', details={'status': 'FAILURE', 'error': str(e)}
         )
-        # Return an empty list upon LLM failure (will be handled by the pipeline wrapper)
-        return []
+        return [] # Return empty list on failure
 
 
 def process_single_email_pipeline(email_data_dict, client: AzureOpenAI):
@@ -264,13 +297,12 @@ def process_single_email_pipeline(email_data_dict, client: AzureOpenAI):
         email_data_dict['p_score'] = 0.0
         email_data_dict['categories_summary'] = f"CRASH: {str(e)[:40]}..."
         email_data_dict['reviewer_action'] = 'CRASHED'
-        # Log the failure (non-Streamlit safe logging)
         print(f"THREAD CRITICAL EXCEPTION for {email_id[:8]}: {e}")
 
     return simulate_db_store_processed_email(email_data_dict) # Return the final dictionary
 
 
-# --- 2. STREAMLIT STATE AND UI LOGIC ---
+# --- STREAMLIT STATE AND UI LOGIC ---
 
 def init_session_state():
     """Initializes all necessary session variables."""
@@ -287,12 +319,13 @@ def init_session_state():
 def handle_reviewer_action(email_id, action_type):
     """Handles reviewer feedback (True/False Positive) and updates audit."""
     
-    # FIX: Audit log write is now safe because it's in the main thread (on_click)
-    simulate_db_log_action(
+    # The log function returns the log entry, which we append safely in the main thread
+    log_entry = simulate_db_log_action(
         email_id=email_id, 
         action=action_type, 
         details={"status": "Reviewer Confirmation"}
     )
+    st.session_state.audit_logs.append(log_entry)
     
     # Update state
     for email in st.session_state.processed_emails:
@@ -305,26 +338,22 @@ def handle_reviewer_action(email_id, action_type):
     st.rerun()
 
 def process_email_batch(uploaded_files, max_workers=5):
-    """
-    The main looper function. Reads files and executes the parallel pipeline.
-    FIXED: Ensures all thread-results are collected and handled safely in the main thread.
-    """
+    """The main looper function. Executes the parallel pipeline."""
     if not uploaded_files:
         st.warning("Please upload at least one email file to begin processing.")
         return
 
     client = st.session_state.api_client
     if client is None:
-        st.error("Cannot run: OpenAI API client is not initialized.")
+        st.error("Cannot run: Azure OpenAI client is not initialized.")
         return
 
     # 1. Read files and prepare list of dictionaries
     emails_to_process = []
     for uploaded_file in uploaded_files:
         try:
-            content = uploaded_file.read().decode("utf-8", errors='ignore') # Added error handler
+            content = uploaded_file.read().decode("utf-8", errors='ignore')
             
-            # Simple content parsing
             subject = content.split('Subject:')[1].split('\n')[0].strip() if 'Subject:' in content else uploaded_file.name
             body = content.split('\n\n', 1)[-1].strip() if '\n\n' in content else content
             
@@ -346,27 +375,24 @@ def process_email_batch(uploaded_files, max_workers=5):
     with st.status("Processing emails in parallel...", expanded=True) as status:
         st.write(f"Starting parallel classification for {len(emails_to_process)} emails (Max workers: {max_workers})...")
         
-        # 2. Start Parallel Execution (The Looper)
+        # 2. Start Parallel Execution
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # FIX: Corrected syntax for futures dict creation
             future_to_email = {
                 executor.submit(process_single_email_pipeline, email_data, client): email_data['id']
                 for email_data in emails_to_process
             }
             
-            # FIX: Corrected syntax for as_completed loop
             for i, future in enumerate(as_completed(future_to_email)):
                 email_id = future_to_email.get(future, 'N/A')
                 
                 try:
-                    result = future.result() # Blocks until thread finishes
+                    result = future.result() 
                     final_processed_emails.append(result) 
                     
                     status.update(label=f"Classifying: {i+1}/{len(emails_to_process)} emails complete.")
                 
                 except Exception as e:
-                    # CRITICAL FIX: If the thread crashes (future.result() raises), 
-                    # create a guaranteed safe dictionary to prevent KeyError in DataFrame.
+                    # Thread crash safety net
                     st.error(f"A processing thread crashed for Email ID {email_id[:8]}: {e}")
                     
                     safe_fail_dict = {
@@ -390,7 +416,6 @@ def process_email_batch(uploaded_files, max_workers=5):
         # 3. Final Main Thread State Update
         st.session_state.processed_emails = final_processed_emails
         
-        # Sort results by P-Score (Highest Priority First)
         st.session_state.processed_emails.sort(key=lambda x: x.get('p_score', 0), reverse=True)
 
         status.update(label="✅ Classification and Prioritization Complete!", state="complete")
@@ -399,19 +424,13 @@ def process_email_batch(uploaded_files, max_workers=5):
 
 def render_prioritization_queue():
     """Renders the main alert queue (DataFrame)."""
-    # FIX: Check if processed_emails is empty before creating DataFrame
     if not st.session_state.processed_emails:
         st.info("Upload emails to start the surveillance pipeline.")
         return
         
     emails_df = pd.DataFrame(st.session_state.processed_emails)
     
-    # Prepare DataFrame for Display
     display_cols = ['p_score', 'subject', 'filename', 'categories_summary', 'reviewer_action', 'id']
-    
-    # CRITICAL FIX: Ensure the columns exist before renaming/indexing
-    # Since process_email_batch is guaranteed to return a dictionary with all these keys (or a safe fail dict)
-    # the KeyError should now be resolved.
     
     emails_df = emails_df.rename(columns={
         'p_score': 'P-Score', 
@@ -419,9 +438,6 @@ def render_prioritization_queue():
         'reviewer_action': 'Action Status'
     })[display_cols].copy()
     
-    # ... rest of the function (color_score, select_row, st.dataframe call) ...
-    # (Removed for brevity, assuming the rest of the function is correct)
-
     def color_score(val):
         if val >= 20: return 'background-color: #F87171; color: white'
         if val >= 10: return 'background-color: #FBBF24'
@@ -455,7 +471,7 @@ def render_prioritization_queue():
         hide_index=True,
         on_select=select_row,
         selection_mode='single-row',
-        width='stretch', # Use 'stretch' instead of use_container_width=True
+        width='stretch',
         key="prioritization_queue_df"
     )
 
@@ -471,7 +487,6 @@ def render_details_pane():
         st.error("Error: Selected email data not found.")
         return
 
-    # Ensure keys are accessed safely even in case of crash
     subject = selected_email.get('subject', 'N/A')
     p_score = selected_email.get('p_score', 0.0)
     action_status = selected_email.get('reviewer_action', 'N/A')
@@ -529,25 +544,34 @@ def render_details_pane():
              st.info("Presidio not installed. Using simple PII masking fallback.")
 
 
-# --- 4. MAIN APPLICATION ---
-
 def main():
     """Sets up the Streamlit UI and handles the main workflow."""
     st.set_page_config(layout="wide", page_title="AI Communication Surveillance")
     
     # Sidebar
     st.sidebar.title("System Status")
-    run_tests()
     
-    # Initialize OpenAI Client (FIXED to ensure client is set)
-    api_key = os.environ.get("AZURE_OPENAI_API_KEY") # Check specific key
+    # Run tests and display results in the sidebar
+    with st.sidebar.status("Running Prioritization Unit Tests...", expanded=True) as status:
+        summary, output = run_tests()
+        st.sidebar.markdown(f"**{summary}**")
+        with st.sidebar.expander("Show Test Execution Details"):
+            st.code(output, language='text')
+
+        # Check if tests passed to update status icon
+        if "Failures: 0, Errors: 0" in summary:
+            status.update(label="✅ All Prioritization Tests Passed!", state="complete", expanded=False)
+        else:
+            status.update(label="❌ Tests Failed! Check Details.", state="error", expanded=True)
+            
+    # Initialize OpenAI Client
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY") 
     
     if not api_key:
         st.error("🚨 **API KEY MISSING:** Please set the `AZURE_OPENAI_API_KEY` environment variable.")
         st.session_state.api_client = None
     else:
         try:
-            # FIX: Use environment variables correctly for client instantiation
             st.session_state.api_client = AzureOpenAI(
                 api_version=os.getenv("API_VERSION"),
                 azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -564,15 +588,13 @@ def main():
     # Main Title and Overview
     st.title("🛡️ AI Communication Surveillance Dashboard")
     st.markdown("**:blue[Bias-Based P-Score]** prioritization for high-throughput compliance review.")
-    
-    
+
     # Application Structure (Two Columns)
     col1, col2 = st.columns([0.6, 0.4])
 
     with col1:
         st.subheader("A. Batch Email Upload and Processing")
         
-        # File Uploader (Max 50 Mails)
         uploaded_files = st.file_uploader(
             "Upload Email Files (TXT or EML format, Max 50)",
             type=['txt', 'eml'],
