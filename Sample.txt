@@ -14,6 +14,8 @@ Please do not share this conversation with anyone else in the team.
 Regards,
 John
 
+===================================================================================
+
 From: sarah.lee@bankcorp.com
 To: external.trader@partnerfund.com
 Date: 2024-10-20
@@ -32,132 +34,39 @@ Sarah
 
 ===========================================================================
 
-def handle_reviewer_action(identifier: str, category: str, action_label: str):
-    """
-    Handle reviewer click. action_label is 'TP' or 'FP'.
-    Updates per-category review state, updates sourcelines feedback, writes reviewer feedback,
-    updates categorized json and session.
-    """
+From: michael.hart@tradingdeskglobal.com
+To: external.broker@fastmarkets.io
+Date: 2024-10-20
+Subject: Need your help on Q4 deal — keep this confidential
 
-    # Feedback text mapping
-    feedback_map = {
-        "TP": "True positive / Correct prediction",
-        "FP": "False positive / Manual review required"
-    }
+Hi,
 
-    # Find the email record in session_state or disk
-    target = None
-    if 'processed_emails' in st.session_state:
-        for e in st.session_state.processed_emails:
-            if e.get('Identifier') == identifier:
-                target = e
-                break
+Please keep this between us only. Do NOT share this with anyone inside or outside the team.  
+The pricing strategy for Q4 will be changed based on the numbers we discussed yesterday.  
+The formal announcement will come next week, but the internal committee has already decided.  
+This is **non-public information** for now.
 
-    # Fallback: load from disk
-    if target is None:
-        p = CATEGORIZED_DIR / f"{identifier}.json"
-        if p.exists():
-            try:
-                with open(p, 'r', encoding='utf-8') as f:
-                    target = json.load(f)
-            except Exception:
-                target = None
+If you can quietly push your clients to **buy heavily today before the update**,  
+you’ll benefit once the new price floor becomes public.  
+We need to **position ourselves before the market reacts**.
 
-    if target is None:
-        st.error(f"Could not find email record for Identifier {identifier}")
-        return
+As we agreed earlier, I can **make sure your approval request gets fast-tracked**  
+if you can “help us out” by prioritizing the orders from our preferred list.  
+Let’s consider this a friendly **gesture**, not part of the formal process.
 
-    # Ensure per-category review structure exists
-    if 'category_reviews' not in target:
-        target['category_reviews'] = {}
+Also, please **stop using the company email for this conversation**;  
+switch to the private WhatsApp number I shared yesterday.  
+We shouldn't leave an official trail for these adjustments.
 
-    # Normalize label
-    action_label = action_label.upper()
-    if action_label not in ('TP', 'FP'):
-        st.error("Invalid reviewer action")
-        return
+On another note, I’ve already raised concerns to HR that the operations team  
+has been **ignoring escalation protocols** and blaming us for delays.  
+Honestly, the way they handled the last compliance query was unprofessional.  
+We should document these behaviors and escalate if needed.
 
-    # Update per-category review
-    target['category_reviews'][category] = action_label
-    target['manualOverride'] = True
+Let me know once the orders are placed.  
+Delete this email after reading.
 
-    # ---------------------------
-    # UPDATE FEEDBACK IN SOURCELINES
-    # ---------------------------
-    for c in target.get("categories", []):
-        if c.get("category") == category:
-            for s in c.get("sourcelines", []):
-                s["feedback"] = feedback_map[action_label]
-            break
+Regards,  
+Michael
 
-    # ---------------------------
-    # PREPARE REVIEWER FEEDBACK OBJECT
-    # ---------------------------
-    fb = {
-        "Identifier": identifier,
-        "category": category,
-        "action": action_label,
-        "feedback": feedback_map[action_label],
-        "timestamp": time.time(),
-        "subject": target.get("subject", ""),
-        "sourcelines": []
-    }
-
-    # Copy updated sourcelines
-    for c in target.get("categories", []):
-        if c.get("category") == category:
-            lines_list = []
-            for s in c.get("sourcelines", []):
-                line_text = s.get("lines", "") if isinstance(s, dict) else str(s)
-                lines_list.append({
-                    "lines": line_text,
-                    "feedback": feedback_map[action_label]
-                })
-            fb["sourcelines"] = lines_list
-            break
-
-    # Save reviewer feedback (deduplicates automatically)
-    add_reviewer_feedback(fb)
-
-    # Save audit log
-    simulate_db_log_action(identifier, "REVIEWER_ACTION", {
-        "category": category,
-        "action": action_label
-    })
-
-    # ---------------------------
-    # COMPUTE OVERALL EMAIL RESULT
-    # ---------------------------
-    cat_reviews = target.get("category_reviews", {})
-    categories_list = [c.get("category") for c in target.get("categories", []) if c.get("category")]
-    if not categories_list:
-        categories_list = list(cat_reviews.keys())
-
-    any_fp = any(cat_reviews.get(c) == 'FP' for c in categories_list if c in cat_reviews)
-    all_tp = categories_list and all(cat_reviews.get(c) == 'TP' for c in categories_list)
-
-    if any_fp:
-        target['falsePositive'] = True
-        target['reviewer_action'] = "FALSE_POSITIVE"
-    elif all_tp:
-        target['falsePositive'] = False
-        target['reviewer_action'] = "TRUE_POSITIVE"
-    else:
-        target['falsePositive'] = False
-        target['reviewer_action'] = "PENDING"
-
-    target["manualOverride"] = True
-
-    # ---------------------------
-    # SAVE UPDATED CATEGORIZED FILE + SESSION UPDATE
-    # ---------------------------
-    try:
-        _write_categorized_file_and_state(identifier, target)
-    except Exception as e:
-        simulate_db_log_action(identifier, "WRITE_UPDATE_ERR", {"error": str(e)})
-
-    # ---------------------------
-    # SAFE UI REFRESH (no rerun errors)
-    # ---------------------------
-    st.success(f"Marked {category} as {action_label}")
-    st.session_state["_force_refresh"] = time.time()
+    
