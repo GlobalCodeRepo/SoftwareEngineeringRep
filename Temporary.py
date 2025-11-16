@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple
+from dotenv import load_dotenv
+from openai import AzureOpenAI
 
 import streamlit as st
 
@@ -728,4 +730,5 @@ def main():
             st.sidebar.download_button("Download CSV", data=cb, file_name="reviewer_feedback.csv")
 
 if __name__ == "__main__":
+    load_dotenv()
     main()
