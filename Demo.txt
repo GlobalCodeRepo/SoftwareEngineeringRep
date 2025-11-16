@@ -1,1 +1,121 @@
+def validate_llm_output(obj):
+    """Validate JSON returned by Azure LLM."""
+    if not isinstance(obj, dict):
+        return False, "Top-level structure must be a JSON object"
+
+    required_top = ["Identifier", "date", "from", "to", "subject", "body", "categories"]
+    for f in required_top:
+        if f not in obj:
+            return False, f"Missing required field: {f}"
+
+    if not isinstance(obj["categories"], list):
+        return False, "categories must be a list"
+
+    for c in obj["categories"]:
+        if "category" not in c or "reason" not in c:
+            return False, "Each category must contain category + reason"
+
+        # Accept BOTH formats
+        if "sourcelines" not in c:
+            # Convert sourceline_quotes → sourcelines
+            if "sourceline_quotes" in c:
+                c["sourcelines"] = [{"lines": x, "feedback": ""} for x in c["sourceline_quotes"]]
+                del c["sourceline_quotes"]
+            else:
+                return False, "Missing sourcelines array"
+
+        # Ensure sourcelines are well-formed
+        for s in c["sourcelines"]:
+            if "lines" not in s:
+                return False, "Each sourceline must have lines field"
+            if "feedback" not in s:
+                s["feedback"] = ""
+
+    return True, "OK"
+
+===========================================================================
+
+LLM_PROMPT_TEMPLATE = (
+    "You are a strict compliance classifier. Return ONLY a JSON object.\n"
+    "NO explanation, NO commentary, NO backticks.\n"
+    "Your output MUST follow EXACTLY this structure:\n\n"
+    "{\n"
+    "  \"Identifier\": \"<id>\",\n"
+    "  \"date\": \"<string>\",\n"
+    "  \"from\": \"<string>\",\n"
+    "  \"to\": \"<string>\",\n"
+    "  \"subject\": \"<string>\",\n"
+    "  \"body\": \"<string>\",\n"
+    "  \"categories\": [\n"
+    "    {\n"
+    "      \"category\": \"<one of: {categories_list}>\",\n"
+    "      \"sourcelines\": [\n"
+    "         {\"lines\": \"<text excerpt>\", \"feedback\": \"\"}\n"
+    "      ],\n"
+    "      \"reason\": \"<why this category applies>\"\n"
+    "    }\n"
+    "  ],\n"
+    "  \"priority\": <0-10>,\n"
+    "  \"falsePositive\": false,\n"
+    "  \"manualOverride\": false,\n"
+    "  \"raiseAlarm\": false\n"
+    "}\n\n"
+    "Email content to classify:\n"
+    "{email_text}\n"
+)
+
+=========================================================
+
+def call_azure_llm(client, masked_email, categories_list):
+    """Call Azure OpenAI with guaranteed strict JSON return."""
+    message = [
+        {"role": "system", "content": LLM_PROMPT_SYSTEM},
+        {
+            "role": "user",
+            "content": LLM_PROMPT_TEMPLATE.format(
+                email_text=json.dumps(masked_email, indent=2),
+                categories_list=",".join(categories_list)
+            )
+        }
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("AZURE_DEPLOYMENT"),
+            messages=message,
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+    except Exception as e:
+        # THIS is the line that helps us avoid silent fallback
+        raise RuntimeError(f"Azure LLM communication failed: {e}")
+
+    try:
+        parsed = json.loads(response.choices[0].message.content)
+        return parsed
+    except Exception as e:
+        raise RuntimeError(f"Azure returned invalid JSON: {e}")
+
+=================================================≈==========================
+
+def classify_email_with_validation(client, masked_email, categories_list, ident):
+    if client is None:
+        simulate_db_log_action(ident, "NO_CLIENT", {})
+        return conservative_rules(masked_email)
+
+    try:
+        parsed = call_azure_llm(client, masked_email, categories_list)
+        ok, msg = validate_llm_output(parsed)
+        if not ok:
+            simulate_db_log_action(ident, "LLM_INVALID", {"reason": msg})
+            # DO NOT FALLBACK SILENTLY – send back structure with error
+            raise RuntimeError(f"LLM returned invalid structure: {msg}")
+        return parsed
+
+    except Exception as e:
+        # Visual error -- user SEES the real problem
+        st.error(f"LLM ERROR in ID {ident}: {e}")
+        simulate_db_log_action(ident, "LLM_FAIL", {"error": str(e)})
+        return conservative_rules(masked_email)
+
 
