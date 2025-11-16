@@ -118,4 +118,51 @@ def classify_email_with_validation(client, masked_email, categories_list, ident)
         simulate_db_log_action(ident, "LLM_FAIL", {"error": str(e)})
         return conservative_rules(masked_email)
 
+======================================
+# Replace your broken prompt block with this exact variable.
+# When you format it, call: prompt = LLM_PROMPT_TEMPLATE.format(subject=..., body=..., categories_list=...)
 
+LLM_PROMPT_TEMPLATE = """You are a strict email compliance classifier. Return ONLY a JSON object and NOTHING ELSE.
+
+Given the email below, do the following:
+subject: {subject}
+body: {body}
+
+NO explanation, NO commentary, NO backticks.
+
+Determine which of the following categories this email most likely belongs to (an email can belong to multiple categories).
+Allowed potential categories are: secrecy, Market Manipulation/Misconduct, Market Bribery, Change in communication style
+
+Return only valid JSON in the exact format below (no extra text).
+Your output MUST follow EXACTLY this structure:
+
+{{
+  "Identifier": "<id>",
+  "date": "<string>",
+  "from": "<string>",
+  "to": "<string>",
+  "subject": "<string>",
+  "body": "<string>",
+  "categories": [
+    {{
+      "category": "<one of: {categories_list}>",
+      "sourcelines": [
+        {{
+          "lines": "<text excerpt>",
+          "feedback": ""
+        }}
+      ],
+      "reason": "<why this category applies>"
+    }}
+  ],
+  "priority": <0-10>,
+  "FalsePositive": false,
+  "manualoverride": false,
+  "raiseAlarm": false
+}}
+
+IMPORTANT:
+- If the email is compliant (no relevant categories), return "categories": [] (an empty list).
+- The "priority" must be a single integer from 0 to 10.
+- Do NOT return any other keys, commentary, or text outside the JSON.
+"""
