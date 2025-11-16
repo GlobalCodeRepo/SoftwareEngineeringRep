@@ -14,6 +14,7 @@ import uuid
 import json
 import time
 import threading
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple
@@ -153,7 +154,7 @@ def init_azure_client():
         return None
     key = os.getenv("AZURE_OPENAI_API_KEY")
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+    api_version = os.getenv("API_VERSION")
     if not key or not endpoint:
         return None
     try:
@@ -196,9 +197,9 @@ def validate_llm_output(obj: Any) -> Tuple[bool, str]:
     return True, "OK"
 
 def call_azure_llm(client, email_obj: Dict[str,Any], categories_list: List[str]) -> Dict[str,Any]:
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_MODEL")
+    deployment = os.getenv("AZURE_DEPLOYMENT")
     if not deployment:
-        raise RuntimeError("Azure deployment/model env var not set (AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_MODEL)")
+        raise RuntimeError("Azure deployment/model env var not set (AZURE_DEPLOYMENT or AZURE_OPENAI_MODEL)")
     email_text = f"""Subject: {email_obj.get('subject','')}
 Body:
 {email_obj.get('body','')}
@@ -208,7 +209,7 @@ Body:
         model=deployment,
         messages=[{"role":"system","content":LLM_PROMPT_SYSTEM}, {"role":"user","content":prompt}],
         temperature=0.0,
-        max_tokens=1200
+        max_tokens=3000
     )
     raw = resp.choices[0].message.content
     parsed = json.loads(raw)
@@ -405,9 +406,17 @@ def add_reviewer_feedback(item: Dict[str, Any]):
 def handle_reviewer_action(identifier: str, category: str, action_label: str):
     """
     Handle reviewer click. action_label is 'TP' or 'FP'.
-    Updates per-category review state, writes reviewer feedback, updates categorized json and session.
+    Updates per-category review state, updates sourcelines feedback, writes reviewer feedback,
+    updates categorized json and session.
     """
-    # find in-memory or disk
+
+    # Feedback text mapping
+    feedback_map = {
+        "TP": "True positive / Correct prediction",
+        "FP": "False positive / Manual review required"
+    }
+
+    # Find the email record in session_state or disk
     target = None
     if 'processed_emails' in st.session_state:
         for e in st.session_state.processed_emails:
@@ -415,6 +424,7 @@ def handle_reviewer_action(identifier: str, category: str, action_label: str):
                 target = e
                 break
 
+    # Fallback: load from disk
     if target is None:
         p = CATEGORIZED_DIR / f"{identifier}.json"
         if p.exists():
@@ -428,46 +438,69 @@ def handle_reviewer_action(identifier: str, category: str, action_label: str):
         st.error(f"Could not find email record for Identifier {identifier}")
         return
 
-    # ensure category_reviews map
+    # Ensure per-category review structure exists
     if 'category_reviews' not in target:
         target['category_reviews'] = {}
 
+    # Normalize label
     action_label = action_label.upper()
     if action_label not in ('TP', 'FP'):
-        st.error('Invalid reviewer action')
+        st.error("Invalid reviewer action")
         return
 
-    # set per-category review
+    # Update per-category review
     target['category_reviews'][category] = action_label
     target['manualOverride'] = True
 
-    # prepare feedback record
-    fb = {
-        'Identifier': identifier,
-        'category': category,
-        'action': action_label,
-        'timestamp': time.time(),
-        'subject': target.get('subject',''),
-        'sourcelines': []
-    }
-
-    for c in target.get('categories', []):
-        if c.get('category') == category:
-            sls = []
-            for s in c.get('sourcelines', []):
-                if isinstance(s, dict):
-                    sls.append(s.get('lines',''))
-                else:
-                    sls.append(str(s))
-            fb['sourcelines'] = sls
+    # ---------------------------
+    # UPDATE FEEDBACK IN SOURCELINES
+    # ---------------------------
+    for c in target.get("categories", []):
+        if c.get("category") == category:
+            for s in c.get("sourcelines", []):
+                s["feedback"] = feedback_map[action_label]
             break
 
-    add_reviewer_feedback(fb)
-    simulate_db_log_action(identifier, 'REVIEWER_ACTION', {'category': category, 'action': action_label})
+    # ---------------------------
+    # PREPARE REVIEWER FEEDBACK OBJECT
+    # ---------------------------
+    fb = {
+        "Identifier": identifier,
+        "category": category,
+        "action": action_label,
+        "feedback": feedback_map[action_label],
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "subject": target.get("subject", ""),
+        "sourcelines": []
+    }
 
-    # compute overall email-level result
-    cat_reviews = target.get('category_reviews', {})
-    categories_list = [c.get('category') for c in target.get('categories', []) if c.get('category')]
+    # Copy updated sourcelines
+    for c in target.get("categories", []):
+        if c.get("category") == category:
+            lines_list = []
+            for s in c.get("sourcelines", []):
+                line_text = s.get("lines", "") if isinstance(s, dict) else str(s)
+                lines_list.append({
+                    "lines": line_text,
+                    "feedback": feedback_map[action_label]
+                })
+            fb["sourcelines"] = lines_list
+            break
+
+    # Save reviewer feedback (deduplicates automatically)
+    add_reviewer_feedback(fb)
+
+    # Save audit log
+    simulate_db_log_action(identifier, "REVIEWER_ACTION", {
+        "category": category,
+        "action": action_label
+    })
+
+    # ---------------------------
+    # COMPUTE OVERALL EMAIL RESULT
+    # ---------------------------
+    cat_reviews = target.get("category_reviews", {})
+    categories_list = [c.get("category") for c in target.get("categories", []) if c.get("category")]
     if not categories_list:
         categories_list = list(cat_reviews.keys())
 
@@ -476,30 +509,29 @@ def handle_reviewer_action(identifier: str, category: str, action_label: str):
 
     if any_fp:
         target['falsePositive'] = True
-        overall_status = 'FALSE_POSITIVE'
+        target['reviewer_action'] = "FALSE_POSITIVE"
     elif all_tp:
         target['falsePositive'] = False
-        overall_status = 'TRUE_POSITIVE'
+        target['reviewer_action'] = "TRUE_POSITIVE"
     else:
         target['falsePositive'] = False
-        overall_status = 'PENDING'
+        target['reviewer_action'] = "PENDING"
 
-    target['reviewer_action'] = overall_status
-    target['manualOverride'] = True
+    target["manualOverride"] = True
 
-    # persist update
+    # ---------------------------
+    # SAVE UPDATED CATEGORIZED FILE + SESSION UPDATE
+    # ---------------------------
     try:
         _write_categorized_file_and_state(identifier, target)
     except Exception as e:
         simulate_db_log_action(identifier, "WRITE_UPDATE_ERR", {"error": str(e)})
 
-    # UI feedback and rerun
-    try:
-        st.success(f"Marked {category} as {action_label}")
-        st.rerun()
-    except Exception:
-        # if rerun not allowed in context, just return (state is persisted)
-        return
+    # ---------------------------
+    # SAFE UI REFRESH (no rerun errors)
+    # ---------------------------
+    st.success(f"Marked {category} as {action_label}")
+    st.session_state["_force_refresh"] = time.time()
 
 def export_reviewer_feedback_download():
     fb = st.session_state.get("reviewer_feedback", [])
@@ -547,6 +579,7 @@ def read_masked_body(identifier: str) -> str:
 # Streamlit UI
 # --------------------
 def main():
+    _force = st.session_state.get("_force_refresh",None)
     st.set_page_config(page_title="Email Surveillance (Azure)", layout="wide")
     st.title("AI Email Surveillance — Azure + Validation")
 
