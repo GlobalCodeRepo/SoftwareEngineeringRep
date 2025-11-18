@@ -166,3 +166,80 @@ IMPORTANT:
 - The "priority" must be a single integer from 0 to 10.
 - Do NOT return any other keys, commentary, or text outside the JSON.
 """
+======================================
+def compute_priority_explainable(email_body: str, categories: List[Dict[str, Any]]) -> int:
+    if not categories:
+        return 1  # compliant email
+    
+    CATEGORY_SEVERITY = {
+        "Market Bribery": 5,
+        "Market Manipulation/Misconduct": 4,
+        "secrecy": 3,
+        "Change in communication style": 2,
+        "Employee ethics": 2,
+        "complaints": 1
+    }
+
+    # 1. Base severity = maximum severity of detected categories
+    base = max(CATEGORY_SEVERITY.get(c["category"], 0) for c in categories)
+
+    # 2. Evidence strength via number of sourcelines
+    findings_count = sum(len(c.get("sourcelines", [])) for c in categories)
+    if findings_count <= 1:
+        evidence = 0
+    elif findings_count == 2:
+        evidence = 1
+    elif findings_count == 3:
+        evidence = 2
+    else:
+        evidence = 3
+
+    # 3. Volume score = number of distinct categories
+    distinct = len({c["category"] for c in categories})
+    if distinct == 1:
+        volume = 0
+    elif distinct == 2:
+        volume = 1
+    else:
+        volume = 2
+
+    # 4. Cross-risk escalation (+1 max)
+    names = {c["category"] for c in categories}
+    escalation = 0
+    critical_pairs = [
+        ("secrecy", "Market Manipulation/Misconduct"),
+        ("secrecy", "Market Bribery"),
+        ("Market Manipulation/Misconduct", "Market Bribery"),
+        ("complaints", "Employee ethics"),
+    ]
+    for a, b in critical_pairs:
+        if a in names and b in names:
+            escalation = 1
+            break
+
+    priority_raw = base + evidence + volume + escalation
+    return max(1, min(priority_raw, 10))
+
+''' priority_raw = base + evidence + volume + escalation
+priority = min(max(priority_raw, 1), 10)
+
+#Example - 
+Case: secrecy + market manipulation
+2 sourcelines
+2 categories
+
+Base severity = 4
+Evidence = 1 (2 findings)
+Volume = 1 (two categories)
+Escalation = 1 (critical pair)
+Total = 4 + 1 + 1 + 1 = 7
+
+
+Severity	Risk category severity	1–5
+Evidence	How many matched patterns(sourcelines)	0–3
+Volume	    How many categories triggered	0–2
+Escalation	Known risky combinations	0–1
+
+Final priority clipped to 1–10.
+'''
+
