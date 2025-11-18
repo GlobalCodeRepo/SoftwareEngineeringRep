@@ -241,5 +241,13 @@ Volume	    How many categories triggered	0–2
 Escalation	Known risky combinations	0–1
 
 Final priority clipped to 1–10.
+
+Emails differentiate much better
+
+Very harmful emails = 9–10
+Suspicious but unclear = 6–7
+Minor issues = 3–5
+Normal but flagged = 2–3
+Clean = 1
 '''
 
