@@ -266,3 +266,39 @@ for f in uploaded:
         p["filename"] = f.name
         emails.append(p)
 
+=========================================================
+
+def export_reviewer_feedback_download():
+    
+    fb = st.session_state.get("reviewer_feedback", [])
+    if not fb:
+        return None, None
+
+    # JSON export
+    jb = json.dumps(fb, ensure_ascii=False, indent=2).encode("utf-8")
+
+    # CSV export
+    rows = [["Identifier", "category", "action", "timestamp", "subject", "sourcelines"]]
+
+    for r in fb:
+        sourceline_text = "; ".join(
+            f"{s.get('lines','').replace('\n',' ').replace('\r',' ')} | feedback: {s.get('feedback','')}"
+            for s in r.get("sourcelines", [])
+        )
+
+        rows.append([
+            r.get("Identifier", ""),
+            r.get("category", ""),
+            r.get("action", ""),
+            str(r.get("timestamp", "")),
+            r.get("subject", "").replace("\n", " ").replace("\r", " "),
+            sourceline_text
+        ])
+
+    csv_lines = []
+    for row in rows:
+        csv_lines.append(",".join(f"\"{col}\"" for col in row))
+
+    cb = ("\n".join(csv_lines)).encode("utf-8")
+
+    return jb, cb
