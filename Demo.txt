@@ -251,3 +251,18 @@ Normal but flagged = 2–3
 Clean = 1
 '''
 
+========
+for f in uploaded:
+    raw = f.read().decode("utf-8", errors="ignore")
+
+    # 🔥 Clean BEFORE parse_emails_txt() — but keep structure intact
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = raw.replace("\t", " ")
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    raw = re.sub(r" +", " ", raw)
+
+    parsed = parse_emails_txt(raw)
+    for p in parsed:
+        p["filename"] = f.name
+        emails.append(p)
+
