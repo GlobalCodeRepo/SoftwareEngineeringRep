@@ -848,3 +848,217 @@ button { padding:4px 10px; cursor:pointer; }
 .left, .right { flex:1; }
 textarea { font-family:monospace; font-size:12px; }
 
+============================================================================================================================
+
+#Folder structure 
+
+code_conversion_workspace/
+  java_parser_helper/
+    pom.xml
+    src/main/java/extractor/Extractor.java
+
+  src/
+    backend/
+      config.py
+      llm_client.py
+      ast_extractor.py
+      graph_builder.py
+      chunker.py
+      doc_generator.py
+      validator.py
+      converter.py
+      test_generator.py
+      data/
+        ast.json
+        pre_processed_files.json
+
+    streamlit_app/
+      app.py               <-- main Streamlit app (REPLACES Flask)
+      pages/
+         1_Class_List.py
+         2_Documentation.py
+         3_Converter.py
+
+  requirements.txt
+
+#requirements.txt
+
+streamlit
+openai
+numpy
+pydantic
+requests
+
+#src/streamlit_app/app.py (Main entry point)
+
+import streamlit as st
+import os
+from pathlib import Path
+from src.backend.config import AST_JSON_PATH, DATA_DIR
+from src.backend.ast_extractor import run_java_extractor
+
+st.set_page_config(page_title="Legacy Code Converter", layout="wide")
+
+st.title("Legacy → SpringBoot Code Converter")
+
+st.markdown("""
+This tool extracts Java classes, generates documentation, validates completeness, 
+and converts legacy Java to Spring Boot code.
+""")
+
+repo = os.getenv("LEGACY_JAVA_REPO")
+if not repo:
+    st.error("Please set environment variable `LEGACY_JAVA_REPO` to your legacy Java source directory.")
+    st.stop()
+
+# Bootstrap
+if not AST_JSON_PATH.exists():
+    with st.spinner("Running JavaParser extractor (one-time)..."):
+        run_java_extractor(repo)
+
+st.success("Environment ready. Use the sidebar to navigate.")
+
+#src/streamlit_app/pages/1_Class_List.py
+
+import streamlit as st
+import json
+from pathlib import Path
+from src.backend.config import AST_JSON_PATH, PREPROCESSED_JSON
+from src.backend.ast_extractor import load_ast
+
+st.title("Legacy Code Classes")
+
+ast = load_ast()
+if not ast:
+    st.error("AST not loaded. Extractor may have failed.")
+    st.stop()
+
+# Preprocessed data
+if PREPROCESSED_JSON.exists():
+    pre = json.loads(PREPROCESSED_JSON.read_text())
+else:
+    pre = {"generation_details": {}}
+
+rows = []
+for f in ast["files"]:
+    for t in f.get("types", []):
+        cls = t["name"]
+        generated = cls in pre["generation_details"]
+        rows.append({
+            "file": f["path"],
+            "class": cls,
+            "generated": generated,
+        })
+
+import pandas as pd
+df = pd.DataFrame(rows)
+
+def doc_status(val):
+    return "Generated" if val else "Pending"
+
+df["Documentation"] = df["generated"].apply(doc_status)
+
+st.dataframe(df[["file", "class", "Documentation"]])
+
+st.info("Click 'Documentation' in sidebar to open a specific class.")
+
+#src/streamlit_app/pages/2_Documentation.py
+
+import streamlit as st
+import json
+from src.backend.ast_extractor import load_ast
+from src.backend.doc_generator import generate_documentation_for_class
+from src.backend.config import PREPROCESSED_JSON
+
+st.title("Documentation Generator")
+
+cls = st.text_input("Enter Class Name (exact)")
+
+if cls:
+    ast = load_ast()
+    target = None
+    for f in ast["files"]:
+        for t in f["types"]:
+            if t["name"] == cls:
+                target = t
+                break
+
+    if not target:
+        st.error("Class not found.")
+        st.stop()
+
+    # Load existing
+    if PREPROCESSED_JSON.exists():
+        pre = json.loads(PREPROCESSED_JSON.read_text())
+    else:
+        pre = {"generation_details": {}}
+
+    if st.button("Generate / Re-Generate Documentation"):
+        with st.spinner("Generating documentation via Azure OpenAI..."):
+            result = generate_documentation_for_class(target)
+            pre["generation_details"][cls] = result
+            PREPROCESSED_JSON.write_text(json.dumps(pre, indent=2))
+        st.success("Documentation updated.")
+
+    if cls in pre["generation_details"]:
+        details = pre["generation_details"][cls]
+        st.subheader("Documentation JSON")
+        st.json(details["doc"])
+
+        st.subheader("Validation Results")
+        st.write(details["validation"])
+
+#src/streamlit_app/pages/3_Converter.py
+
+import streamlit as st
+import json
+from pathlib import Path
+from src.backend.config import PREPROCESSED_JSON, DATA_DIR
+from src.backend.converter import convert_doc_to_spring
+from src.backend.test_generator import generate_tests
+
+st.title("Spring Boot Conversion")
+
+cls = st.text_input("Class Name to Convert")
+
+if cls:
+    if PREPROCESSED_JSON.exists():
+        pre = json.loads(PREPROCESSED_JSON.read_text())
+    else:
+        st.error("No documentation generated yet.")
+        st.stop()
+
+    if cls not in pre["generation_details"]:
+        st.error("Generate documentation first.")
+        st.stop()
+
+    details = pre["generation_details"][cls]
+
+    if st.button("Convert to Spring Boot"):
+        with st.spinner("Generating Spring Boot code..."):
+            conv = convert_doc_to_spring(details["doc"])
+
+        out_dir = DATA_DIR.parent.parent / "generated"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if conv["pom"]:
+            (out_dir / "pom.xml").write_text(conv["pom"])
+
+        for path, content in conv["files"]:
+            p = out_dir / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+
+        st.success("Spring Boot Code Generated!")
+        st.write(conv["notes"])
+
+    if st.button("Generate JUnit Tests"):
+        with st.spinner("Generating JUnit tests..."):
+            tests = generate_tests(details["doc"])
+        out_dir = DATA_DIR.parent.parent / "generated"
+        for path, content in tests:
+            p = out_dir / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        st.success(f"Generated {len(tests)} test files.")
+
