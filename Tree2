@@ -1,4 +1,124 @@
 
+package extractor;
+
+import com.github.javaparser.*;
+import com.github.javaparser.ast.*;
+import com.github.javaparser.ast.body.*;
+import com.google.gson.*;
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class Extractor {
+
+    public static void main(String[] args) throws Exception {
+
+        if (args.length != 2) {
+            System.out.println("Usage: Extractor <repo-path> <out-json>");
+            return;
+        }
+
+        String repoPath = args[0];
+        String outJson = args[1];
+
+        File repoDir = new File(repoPath);
+        if (!repoDir.exists()) {
+            System.err.println("ERROR: Repository folder NOT found: " + repoDir.getAbsolutePath());
+            return;
+        }
+
+        System.out.println("Scanning repo: " + repoDir.getAbsolutePath());
+
+        // Configure parser properly
+        ParserConfiguration config = new ParserConfiguration()
+                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_11)
+                .setAttributeComments(false)
+                .setTabSize(4);
+
+        JavaParser parser = new JavaParser(config);
+
+        List<Map<String, Object>> fileResults = new ArrayList<>();
+
+        Files.walk(Paths.get(repoPath))
+                .filter(f -> f.toString().endsWith(".java"))
+                .forEach(path -> {
+                    try {
+                        Map<String, Object> fileJson = processJavaFile(path.toFile(), parser);
+                        fileResults.add(fileJson);
+
+                    } catch (Exception ex) {
+                        System.err.println("FAILED to process file: " + path);
+                        ex.printStackTrace();
+                    }
+                });
+
+        Map<String, Object> root = new HashMap<>();
+        root.put("files", fileResults);
+
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        String jsonOutput = gson.toJson(root);
+
+        Files.write(Paths.get(outJson), jsonOutput.getBytes());
+        System.out.println("Wrote AST JSON → " + outJson);
+    }
+
+    private static Map<String, Object> processJavaFile(File file, JavaParser parser) throws Exception {
+        Map<String, Object> fileJson = new HashMap<>();
+        fileJson.put("path", file.getName());
+
+        String code = new String(Files.readAllBytes(file.toPath()));
+
+        ParseResult<CompilationUnit> result = parser.parse(code);
+
+        if (!result.isSuccessful() || !result.getResult().isPresent()) {
+            System.err.println("\n### PARSE FAILED for file: " + file.getName());
+            for (Problem p : result.getProblems()) {
+                System.err.println("Parser problem → " + p.toString());
+            }
+            fileJson.put("types", new ArrayList<>());
+            return fileJson;
+        }
+
+        CompilationUnit cu = result.getResult().get();
+        List<Map<String, Object>> typesList = new ArrayList<>();
+
+        cu.findAll(ClassOrInterfaceDeclaration.class).forEach(c -> {
+            Map<String, Object> typeJson = new HashMap<>();
+            typeJson.put("name", c.getNameAsString());
+
+            // FIELDS
+            List<Map<String, Object>> fields = new ArrayList<>();
+            c.getFields().forEach(f -> {
+                Map<String, Object> fJson = new HashMap<>();
+                fJson.put("name", f.getVariables().get(0).getNameAsString());
+                fJson.put("type", f.getVariables().get(0).getTypeAsString());
+                fields.add(fJson);
+            });
+            typeJson.put("fields", fields);
+
+            // METHODS
+            List<Map<String, Object>> methods = new ArrayList<>();
+            c.getMethods().forEach(m -> {
+                Map<String, Object> mJson = new HashMap<>();
+                mJson.put("name", m.getNameAsString());
+                mJson.put("returnType", m.getType().toString());
+                mJson.put("parameters", m.getParameters().toString());
+                methods.add(mJson);
+            });
+            typeJson.put("methods", methods);
+
+            typesList.add(typeJson);
+        });
+
+        fileJson.put("types", typesList);
+        return fileJson;
+    }
+}
+
+=====
+
+
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
