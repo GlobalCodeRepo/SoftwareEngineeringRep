@@ -1068,5 +1068,543 @@ with right:
 
 ==============
 ===============================================================
+chunker.py
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, List
+from .llm_client import chat_json
+
+SEGMENTER_SYSTEM_PROMPT = """
+You are helping to refactor a huge legacy Java god class into logical modules.
+
+You receive a JSON with:
+{
+  "className": "...",
+  "methods": [
+    {"name":"...", "parameters":"[String a, int b]", "returnType":"void"},
+    ...
+  ]
+}
+
+Group methods into coherent modules (services) based on their names and likely responsibilities.
+
+Return JSON:
+
+{
+  "modules":[
+    {
+      "name":"UserService",
+      "purpose":"short description",
+      "methods":["login","registerUser","resetPassword"]
+    },
+    {
+      "name":"ChequeProcessingService",
+      "purpose":"...",
+      "methods":["processCheque","cancelCheque","processChequeBatch"]
+    }
+  ]
+}
+
+Rules:
+- Every method must belong to exactly one module.
+- Prefer 4-10 methods per module; if very many, create more modules.
+- Do NOT invent methods that don't exist in the input.
+"""
+
+@dataclass
+class Segment:
+    segment_id: str
+    file_path: str
+    origin_class: str
+    module_name: str
+    module_purpose: str
+    methods: List[Dict[str, Any]]
+    type_obj: Dict[str, Any]
 
 
+def _segment_single_class(file_path: str, type_obj: Dict[str, Any]) -> List[Segment]:
+    """
+    For one AST class (like MainApplication), ask LLM to group methods into modules.
+    """
+    methods = type_obj.get("methods", [])
+    if not methods:
+        return []
+
+    # If class is small, just one module = class itself
+    if len(methods) <= 8:
+        seg_id = f"{file_path}::{type_obj['name']}::Default"
+        return [
+            Segment(
+                segment_id=seg_id,
+                file_path=file_path,
+                origin_class=type_obj["name"],
+                module_name=type_obj["name"],
+                module_purpose=f"Module representing class {type_obj['name']}",
+                methods=methods,
+                type_obj=type_obj,
+            )
+        ]
+
+    payload = {
+        "className": type_obj["name"],
+        "methods": [
+            {
+                "name": m.get("name"),
+                "parameters": m.get("parameters"),
+                "returnType": m.get("returnType"),
+            }
+            for m in methods
+        ],
+    }
+
+    result = chat_json(SEGMENTER_SYSTEM_PROMPT, payload, max_tokens=1200)
+    modules = result.get("modules", [])
+
+    # Map method name -> method object
+    method_by_name = {m.get("name"): m for m in methods}
+    segments: List[Segment] = []
+
+    for idx, mod in enumerate(modules, start=1):
+        m_names = mod.get("methods", [])
+        seg_methods = [method_by_name[n] for n in m_names if n in method_by_name]
+        if not seg_methods:
+            continue
+        module_name = mod.get("name") or f"{type_obj['name']}Module{idx}"
+        seg_id = f"{file_path}::{type_obj['name']}::{module_name}"
+        segments.append(
+            Segment(
+                segment_id=seg_id,
+                file_path=file_path,
+                origin_class=type_obj["name"],
+                module_name=module_name,
+                module_purpose=mod.get("purpose", ""),
+                methods=seg_methods,
+                type_obj=type_obj,
+            )
+        )
+
+    # Fallback: if LLM messes up, create one module
+    if not segments:
+        seg_id = f"{file_path}::{type_obj['name']}::Default"
+        return [
+            Segment(
+                segment_id=seg_id,
+                file_path=file_path,
+                origin_class=type_obj["name"],
+                module_name=type_obj["name"],
+                module_purpose=f"Module representing class {type_obj['name']}",
+                methods=methods,
+                type_obj=type_obj,
+            )
+        ]
+
+    return segments
+
+
+def build_segments(ast_json: Dict[str, Any]) -> List[Segment]:
+    """
+    From full AST JSON, build module segments for all classes.
+    """
+    all_segments: List[Segment] = []
+    for f in ast_json.get("files", []):
+        path = f.get("path", "")
+        for t in f.get("types", []):
+            all_segments.extend(_segment_single_class(path, t))
+    return all_segments
+
+=============================================================================================
+doc_generator.py
+
+from __future__ import annotations
+import json
+from typing import Dict, Any
+from .chunker import Segment
+from .llm_client import chat_json
+from .validator import validate_doc_for_segment
+from .config import DOC_AUTO_RETRY, DOC_VALIDATION_THRESHOLD
+
+DOC_SYSTEM_PROMPT = """
+You document ONE logical module extracted from a legacy Java application.
+
+Input JSON:
+{
+  "module_name":"...",
+  "origin_class":"...",
+  "purpose":"short description of module",
+  "methods":[
+    {"name":"...","parameters":"[String a, int b]","returnType":"void"},
+    ...
+  ]
+}
+
+Return JSON:
+
+{
+  "module_name":"...",
+  "description":"high-level description of responsibilities",
+  "methods":[
+    {
+      "name":"...",
+      "description":"what this method does",
+      "parameters":[
+        {"name":"...", "type":"...", "description":"..."}
+      ],
+      "return":{"type":"...", "description":"..."}
+    }
+  ]
+}
+
+Rules:
+- Do NOT invent methods that are not present.
+- Use method names and parameter types to infer behaviour.
+"""
+
+def generate_documentation_for_segment(seg: Segment) -> Dict[str, Any]:
+    attempts = 0
+    best = None
+    best_score = -1.0
+
+    payload = {
+        "module_name": seg.module_name,
+        "origin_class": seg.origin_class,
+        "purpose": seg.module_purpose,
+        "methods": seg.methods,
+    }
+
+    while attempts <= DOC_AUTO_RETRY:
+        attempts += 1
+        doc = chat_json(DOC_SYSTEM_PROMPT, payload, max_tokens=1600)
+        validation = validate_doc_for_segment(seg, doc)
+        score = (
+            validation["method_coverage_percentage"]
+            + validation["description_quality_estimate"]
+        ) / 200.0  # normalise 0–1
+
+        if score > best_score:
+            best_score = score
+            best = {"doc": doc, "validation": validation}
+
+        if score >= DOC_VALIDATION_THRESHOLD:
+            break
+
+    return best
+
+=============================================================
+validator.py
+
+from __future__ import annotations
+from typing import Dict, Any, Set
+from .chunker import Segment
+from .llm_client import chat_json
+
+DESCRIPTION_VALIDATOR_SYSTEM = """
+You validate the quality of documentation for one module.
+
+Input JSON:
+{
+  "module_name":"...",
+  "origin_class":"...",
+  "methods_in_code":["m1","m2",...],
+  "methods_in_doc":["m1","m2",...],
+  "doc_description":"..."
+}
+
+Return JSON:
+{
+  "description_quality_estimate": 90.0,
+  "comments":"short explanation"
+}
+"""
+
+def validate_doc_for_segment(seg: Segment, doc: Dict[str, Any]) -> Dict[str, Any]:
+    code_methods: Set[str] = {m.get("name") for m in seg.methods}
+    doc_methods: Set[str] = {m.get("name") for m in doc.get("methods", [])}
+
+    total = len(code_methods) or 1
+    coverage = len(code_methods & doc_methods) / total
+
+    payload = {
+        "module_name": seg.module_name,
+        "origin_class": seg.origin_class,
+        "methods_in_code": sorted(code_methods),
+        "methods_in_doc": sorted(doc_methods),
+        "doc_description": doc.get("description", ""),
+    }
+    j = chat_json(DESCRIPTION_VALIDATOR_SYSTEM, payload, max_tokens=600)
+
+    return {
+        "method_coverage_percentage": coverage * 100.0,
+        "missing_methods": sorted(list(code_methods - doc_methods)),
+        "description_quality_estimate": j.get("description_quality_estimate", 0.0),
+        "comments": j.get("comments", ""),
+    }
+
+======================================================
+convertor.py
+
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple
+import base64
+from .llm_client import chat_json
+
+CONVERTER_SYSTEM_PROMPT = """
+You convert documentation of ONE module into Spring Boot Java 11 code.
+
+Input JSON = the documentation object:
+{
+  "module_name":"ChequeProcessingService",
+  "description":"...",
+  "methods":[{...}]
+}
+
+Output JSON:
+{
+  "files":[
+    {"path":"src/main/java/com/legacyconv/service/ChequeProcessingService.java","content":"<base64>"},
+    {"path":"src/main/java/com/legacyconv/controller/ChequeProcessingController.java","content":"<base64 or plain text>"}
+  ],
+  "pom":"<optional base64 pom.xml, blank if not needed>",
+  "notes":"short explanation of architecture choices"
+}
+
+Rules:
+- Java 11, Spring Boot 3 style.
+- Use @Service for business logic, @RestController for endpoints.
+- Use DTOs for request/response where appropriate.
+- Only implement methods described in the documentation.
+- If details are missing, add TODO comments but keep code compiling.
+"""
+
+def convert_doc_to_spring(doc: Dict[str, Any]) -> Dict[str, Any]:
+    j = chat_json(CONVERTER_SYSTEM_PROMPT, doc, max_tokens=2200)
+    files: List[Tuple[str, str]] = []
+    for f in j.get("files", []):
+        path = f.get("path")
+        raw = f.get("content", "")
+        try:
+            content = base64.b64decode(raw).decode("utf-8")
+        except Exception:
+            content = raw
+        files.append((path, content))
+
+    pom_content = ""
+    raw_pom = j.get("pom", "")
+    if raw_pom:
+        try:
+            pom_content = base64.b64decode(raw_pom).decode("utf-8")
+        except Exception:
+            pom_content = raw_pom
+
+    return {"files": files, "pom": pom_content, "notes": j.get("notes", "")}
+======================================================
+test_generator.py
+
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple
+import base64
+from .llm_client import chat_json
+
+TEST_SYSTEM_PROMPT = """
+You write JUnit 5 tests for Spring Boot services/controllers
+based only on the module documentation JSON.
+
+Input: the same documentation JSON.
+
+Output JSON:
+{
+  "tests":[
+    {"path":"src/test/java/com/legacyconv/service/ChequeProcessingServiceTest.java","content":"<base64 or code>"}
+  ]
+}
+"""
+
+def generate_tests(doc: Dict[str, Any]) -> List[Tuple[str, str]]:
+    j = chat_json(TEST_SYSTEM_PROMPT, doc, max_tokens=1600)
+    tests: List[Tuple[str, str]] = []
+    for t in j.get("tests", []):
+        path = t.get("path")
+        raw = t.get("content", "")
+        try:
+            content = base64.b64decode(raw).decode("utf-8")
+        except Exception:
+            content = raw
+        tests.append((path, content))
+    return tests
+
+==================================
+
+app.py 
+
+
+from __future__ import annotations
+import json
+import os
+from pathlib import Path
+from typing import Dict, Any
+
+import pandas as pd
+import streamlit as st
+
+from backend.config import AST_JSON_PATH, PREPROCESSED_JSON, DATA_DIR, LEGACY_REPO_ENV
+from backend.ast_extractor import load_ast, run_java_extractor
+from backend.chunker import build_segments, Segment
+from backend.doc_generator import generate_documentation_for_segment
+from backend.converter import convert_doc_to_spring
+from backend.test_generator import generate_tests
+
+st.set_page_config(page_title="Legacy → SpringBoot Converter", layout="wide")
+st.title("Legacy Code Conversion Tool (Multi-Module Segmentation)")
+
+# --- environment check ---
+repo_path = os.getenv(LEGACY_REPO_ENV)
+if not repo_path:
+    st.error(f"Set environment variable {LEGACY_REPO_ENV} to your legacy Java repo path.")
+    st.stop()
+
+repo_path = str(Path(repo_path).resolve())
+st.sidebar.markdown(f"**Legacy repo:** `{repo_path}`")
+
+if not AST_JSON_PATH.exists():
+    with st.spinner("Running JavaParser extractor for the first time..."):
+        run_java_extractor(repo_path)
+
+
+@st.cache_data
+def get_ast() -> Dict[str, Any]:
+    return load_ast()
+
+
+@st.cache_data
+def get_segments() -> Dict[str, Segment]:
+    ast = get_ast()
+    seg_list = build_segments(ast)
+    return {seg.segment_id: seg for seg in seg_list}
+
+
+def load_pre() -> Dict[str, Any]:
+    if PREPROCESSED_JSON.exists():
+        return json.loads(PREPROCESSED_JSON.read_text(encoding="utf-8"))
+    return {"generation_details": {}}
+
+
+def save_pre(data: Dict[str, Any]):
+    PREPROCESSED_JSON.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+segments = get_segments()
+pre = load_pre()
+
+segment_ids = list(segments.keys())
+if not segment_ids:
+    st.error("No segments found in AST. Check that your legacy repo contains .java files.")
+    st.stop()
+
+# Sidebar selector
+selected_id = st.sidebar.selectbox("Select Module Segment", segment_ids)
+
+# Table of segments
+left, right = st.columns([1.3, 1.7])
+
+with left:
+    rows = []
+    for seg_id, seg in segments.items():
+        info = pre["generation_details"].get(seg_id)
+        status = "Generated" if info else "Pending"
+        quality = ""
+        if info:
+            v = info["validation"]
+            cov = v["method_coverage_percentage"]
+            qual = v["description_quality_estimate"]
+            quality = f"{(cov + qual) / 2.0:.1f}%"
+        rows.append(
+            {
+                "Segment ID": seg_id,
+                "Module": seg.module_name,
+                "Origin Class": seg.origin_class,
+                "File": seg.file_path,
+                "Doc Status": status,
+                "Doc Quality": quality,
+            }
+        )
+    df = pd.DataFrame(rows)
+    st.subheader("Segments (Modules)")
+    st.dataframe(df, use_container_width=True)
+
+with right:
+    seg = segments[selected_id]
+    st.subheader(f"Module: {seg.module_name}")
+    st.caption(f"Origin class: {seg.origin_class}  •  File: {seg.file_path}")
+    st.write(f"**LLM-inferred purpose:** {seg.module_purpose or '(not set)'}")
+
+    if selected_id not in pre["generation_details"]:
+        if st.button("Generate Documentation for this Module"):
+            with st.spinner("Generating documentation via Azure OpenAI..."):
+                result = generate_documentation_for_segment(seg)
+                pre["generation_details"][selected_id] = result
+                save_pre(pre)
+            st.experimental_rerun()
+        else:
+            st.info("Documentation not generated yet. Click the button above.")
+    else:
+        details = pre["generation_details"][selected_id]
+        doc = details["doc"]
+        validation = details["validation"]
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Re-Generate Documentation"):
+                with st.spinner("Re-generating documentation..."):
+                    result = generate_documentation_for_segment(seg)
+                    pre["generation_details"][selected_id] = result
+                    save_pre(pre)
+                st.experimental_rerun()
+        with b2:
+            if st.button("Convert to Spring Boot & Generate Tests"):
+                with st.spinner("Generating Spring Boot code..."):
+                    conv = convert_doc_to_spring(doc)
+                out_dir = DATA_DIR.parent / "generated"
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                if conv["pom"]:
+                    (out_dir / "pom.xml").write_text(conv["pom"], encoding="utf-8")
+                for path, content in conv["files"]:
+                    p = out_dir / path
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+
+                with st.spinner("Generating tests..."):
+                    tests = generate_tests(doc)
+                for path, content in tests:
+                    p = out_dir / path
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+
+                st.success(
+                    f"Generated {len(conv['files'])} Spring Boot files and {len(tests)} tests under `{out_dir}`."
+                )
+                if conv["notes"]:
+                    st.write("Notes from generator:")
+                    st.write(conv["notes"])
+
+        st.markdown("### Documentation JSON")
+        st.json(doc)
+
+        st.markdown("### Validation")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("Coverage & Quality")
+            st.json(
+                {
+                    "method_coverage_percentage": validation["method_coverage_percentage"],
+                    "description_quality_estimate": validation["description_quality_estimate"],
+                }
+            )
+        with c2:
+            st.write("Missing Methods / Comments")
+            st.json(
+                {
+                    "missing_methods": validation["missing_methods"],
+                    "comments": validation["comments"],
+                }
+            )
