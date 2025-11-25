@@ -1,0 +1,880 @@
+Project Structure (0)
+
+code_conversion_workspace/
+  app.py                 # Streamlit app entry-point
+  requirements.txt
+
+  backend/
+    __init__.py
+    config.py
+    llm_client.py
+    ast_extractor.py
+    chunker.py
+    doc_generator.py
+    validator.py
+    converter.py
+    test_generator.py
+    data/
+      (empty to start)
+
+  java_parser_helper/
+    pom.xml
+    src/main/java/extractor/Extractor.java
+
+
+You’ll also have your legacy Java repo somewhere else, e.g. C:\legacy_java_repo\... containing your big class and other files.
+================================================================
+1 requirements.txt
+
+streamlit
+openai
+numpy
+pydantic
+requests
+====================================================================
+2. JavaParser helper (multi-class, nested classes, big files)
+java_parser_helper/pom.xml
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example</groupId>
+  <artifactId>javaparser-extractor</artifactId>
+  <version>1.0-SNAPSHOT</version>
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.github.javaparser</groupId>
+      <artifactId>javaparser-core</artifactId>
+      <version>3.25.4</version>
+    </dependency>
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.10.1</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-assembly-plugin</artifactId>
+        <version>3.4.2</version>
+        <configuration>
+          <descriptorRefs>
+            <descriptorRef>jar-with-dependencies</descriptorRef>
+          </descriptorRefs>
+          <archive>
+            <manifest>
+              <mainClass>extractor.Extractor</mainClass>
+            </manifest>
+          </archive>
+        </configuration>
+        <executions>
+          <execution>
+            <id>make-assembly</id>
+            <phase>package</time>
+            <goals>
+              <goal>single</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+
+java_parser_helper/src/main/java/extractor/Extractor.java
+
+package extractor;
+
+import com.github.javaparser.*;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.*;
+import com.google.gson.GsonBuilder;
+
+import java.io.Writer;
+import java.nio.file.*;
+import java.util.*;
+
+public class Extractor {
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 2) {
+            System.err.println("Usage: Extractor <repo-root> <out-json>");
+            System.exit(1);
+        }
+        Path repo = Paths.get(args[0]);
+        Path out = Paths.get(args[1]);
+
+        JavaParser parser = new JavaParser();
+
+        List<Map<String, Object>> files = new ArrayList<>();
+
+        Files.walk(repo)
+                .filter(p -> p.toString().endsWith(".java"))
+                .forEach(p -> {
+                    try {
+                        String src = Files.readString(p);
+                        ParseResult<CompilationUnit> result = parser.parse(src);
+                        if (!result.isSuccessful() || !result.getResult().isPresent()) {
+                            System.err.println("Parse failed for " + p);
+                            return;
+                        }
+                        CompilationUnit cu = result.getResult().get();
+
+                        Map<String, Object> fileObj = new LinkedHashMap<>();
+                        fileObj.put("path", repo.relativize(p).toString());
+                        fileObj.put("source", src);
+
+                        List<Map<String, Object>> types = new ArrayList<>();
+                        for (TypeDeclaration<?> td : cu.getTypes()) {
+                            types.add(extractType(td));
+                        }
+                        fileObj.put("types", types);
+                        files.add(fileObj);
+                    } catch (Exception e) {
+                        System.err.println("Failed parse " + p + ": " + e.getMessage());
+                    }
+                });
+
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("files", files);
+
+        try (Writer w = Files.newBufferedWriter(out)) {
+            w.write(new GsonBuilder().setPrettyPrinting().create().toJson(root));
+        }
+        System.out.println("Wrote AST JSON to " + out.toAbsolutePath());
+    }
+
+    private static Map<String, Object> extractType(TypeDeclaration<?> td) {
+        Map<String, Object> typeObj = new LinkedHashMap<>();
+        typeObj.put("name", td.getNameAsString());
+        typeObj.put("kind", td.getClass().getSimpleName());
+        typeObj.put("modifiers", td.getModifiers().toString());
+
+        List<Map<String, Object>> fields = new ArrayList<>();
+        for (FieldDeclaration fd : td.getFields()) {
+            for (VariableDeclarator var : fd.getVariables()) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("name", var.getNameAsString());
+                f.put("type", var.getType().asString());
+                f.put("modifiers", fd.getModifiers().toString());
+                fields.add(f);
+            }
+        }
+        typeObj.put("fields", fields);
+
+        List<Map<String, Object>> methods = new ArrayList<>();
+        for (MethodDeclaration md : td.getMethods()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", md.getNameAsString());
+            m.put("returnType", md.getType().asString());
+            m.put("modifiers", md.getModifiers().toString());
+            m.put("beginLine", md.getBegin().isPresent() ? md.getBegin().get().line : -1);
+            m.put("endLine", md.getEnd().isPresent() ? md.getEnd().get().line : -1);
+            m.put("body", md.getBody().isPresent() ? md.getBody().get().toString() : "");
+            List<Map<String, String>> params = new ArrayList<>();
+            md.getParameters().forEach(p -> {
+                Map<String, String> param = new LinkedHashMap<>();
+                param.put("name", p.getNameAsString());
+                param.put("type", p.getType().asString());
+                params.add(param);
+            });
+            m.put("parameters", params);
+            methods.add(m);
+        }
+        typeObj.put("methods", methods);
+
+        List<Map<String, Object>> inner = new ArrayList<>();
+        for (BodyDeclaration<?> bd : td.getMembers()) {
+            if (bd.isClassOrInterfaceDeclaration()) {
+                inner.add(extractType((TypeDeclaration<?>) bd));
+            }
+        }
+        typeObj.put("innerClasses", inner);
+
+        return typeObj;
+    }
+}
+
+
+Build once :
+
+cd java_parser_helper
+mvn -q clean package
+cd ..
+
+=====================================================================
+
+3. Backend Python modules
+backend/__init__.py
+
+# empty file, just to make backend a package
+
+=====================
+backend/config.py
+
+from __future__ import annotations
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT", "gpt-35-turbo")
+AZURE_DEPLOYMENT_EMBED = os.getenv("AZURE_DEPLOYMENT_EMBED", "text-embedding-3-small")
+
+DATA_DIR = BASE_DIR / "backend" / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+AST_JSON_PATH = DATA_DIR / "ast.json"
+PREPROCESSED_JSON = DATA_DIR / "pre_processed_files.json"
+
+MAX_METHOD_CHARS = 6000
+DOC_AUTO_RETRY = 1
+DOC_VALIDATION_THRESHOLD = 0.9
+
+JAVA_HELPER_DIR = BASE_DIR / "java_parser_helper"
+JAVA_AST_OUT = AST_JSON_PATH
+
+LEGACY_REPO_ENV = "LEGACY_JAVA_REPO"
+
+================
+
+backend/llm_client.py
+
+
+from __future__ import annotations
+import json
+from typing import Any, Dict, List
+from openai import OpenAI
+from .config import (
+    AZURE_OPENAI_KEY,
+    AZURE_OPENAI_ENDPOINT,
+    AZURE_DEPLOYMENT_CHAT,
+    AZURE_DEPLOYMENT_EMBED,
+)
+
+client = OpenAI(api_key=AZURE_OPENAI_KEY, base_url=AZURE_OPENAI_ENDPOINT)
+
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    resp = client.embeddings.create(
+        model=AZURE_DEPLOYMENT_EMBED,
+        input=texts,
+    )
+    return [e.embedding for e in resp.data]
+
+
+def chat_json(system_prompt: str, user_payload: Any, max_tokens: int = 1500) -> Dict[str, Any]:
+    resp = client.chat.completions.create(
+        deployment_id=AZURE_DEPLOYMENT_CHAT,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload)},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
+    text = resp.choices[0].message.content
+    try:
+        return json.loads(text)
+    except Exception:
+        # try to salvage JSON substring if model adds text
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(text[start : end + 1])
+        raise
+
+================
+backend/ast_extractor.py
+
+from __future__ import annotations
+import json
+import subprocess
+import shutil
+from pathlib import Path
+from typing import Dict, Any
+
+from .config import JAVA_HELPER_DIR, JAVA_AST_OUT, AST_JSON_PATH
+
+
+def run_java_extractor(repo_path: str) -> None:
+    jar_candidates = list((JAVA_HELPER_DIR / "target").glob("*jar-with-dependencies.jar"))
+    if not jar_candidates:
+        raise RuntimeError(
+            "Java helper jar not found. Build it with `mvn -q clean package` in java_parser_helper/."
+        )
+    jar = jar_candidates[0]
+    java = shutil.which("java")
+    if not java:
+        raise RuntimeError("`java` not found in PATH")
+
+    cmd = [java, "-jar", str(jar), repo_path, str(JAVA_AST_OUT)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Extractor failed: {proc.stderr}")
+    print(proc.stdout)
+
+
+def load_ast() -> Dict[str, Any]:
+    if not AST_JSON_PATH.exists():
+        return {"files": []}
+    return json.loads(AST_JSON_PATH.read_text(encoding="utf-8"))
+
+==================
+backend/chunker.py (classes & inner classes, plus method splitting for large bodies)
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, List
+from .config import MAX_METHOD_CHARS
+from .llm_client import chat_json
+
+@dataclass
+class MethodSummary:
+    class_name: str
+    method_name: str
+    signature: Dict[str, Any]
+    description: str
+
+SEGMENT_SYSTEM_PROMPT = """
+You summarise one segment of a Java method.
+Input JSON: {"methodName":"...", "segment":"<code>"}
+Return JSON: {"summary":"short precise description of what this segment does"}
+"""
+
+METHOD_SYSTEM_PROMPT = """
+You summarise a full Java method from multiple segment summaries.
+Input:
+{
+  "method": {"name":"...", "returnType":"...", "parameters":[{"name":"...","type":"..."}]},
+  "segments": ["...", "..."]
+}
+Return JSON: {"description":"short precise description of the method's purpose and behaviour"}
+"""
+
+def split_method_body(body: str) -> List[str]:
+    if len(body) <= MAX_METHOD_CHARS:
+        return [body]
+    segments: List[str] = []
+    current: List[str] = []
+    size = 0
+    for line in body.splitlines():
+        current.append(line)
+        size += len(line)
+        if (
+            size >= MAX_METHOD_CHARS
+            or line.strip().endswith(";")
+            or line.strip().startswith(("if", "for", "while", "switch"))
+        ):
+            segments.append("\n".join(current))
+            current = []
+            size = 0
+    if current:
+        segments.append("\n".join(current))
+    return segments
+
+
+def summarise_method(class_name: str, method_meta: Dict[str, Any]) -> MethodSummary:
+    body = method_meta.get("body", "") or ""
+    segments = split_method_body(body)
+    seg_summaries: List[str] = []
+    for seg in segments:
+        payload = {"methodName": method_meta["name"], "segment": seg}
+        j = chat_json(SEGMENT_SYSTEM_PROMPT, payload, max_tokens=300)
+        seg_summaries.append(j.get("summary", ""))
+
+    payload2 = {
+        "method": {
+            "name": method_meta["name"],
+            "returnType": method_meta.get("returnType"),
+            "parameters": method_meta.get("parameters", []),
+        },
+        "segments": seg_summaries,
+    }
+    j2 = chat_json(METHOD_SYSTEM_PROMPT, payload2, max_tokens=300)
+    return MethodSummary(
+        class_name=class_name,
+        method_name=method_meta["name"],
+        signature=payload2["method"],
+        description=j2.get("description", ""),
+    )
+
+
+def flatten_types(ast_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Flatten top-level and inner classes into a list of
+    {"file":..., "qualified_name":..., "type_obj":...}
+    """
+    result: List[Dict[str, Any]] = []
+
+    def walk_type(t: Dict[str, Any], file_path: str, prefix: str | None = None):
+        qualified = t["name"] if not prefix else f"{prefix}.{t['name']}"
+        result.append({"file": file_path, "qualified_name": qualified, "type_obj": t})
+        for inner in t.get("innerClasses", []):
+            walk_type(inner, file_path, qualified)
+
+    for f in ast_json.get("files", []):
+        p = f["path"]
+        for t in f.get("types", []):
+            walk_type(t, p, None)
+
+    return result
+
+=================
+backend/validator.py (AST skeleton + LLM description validation)
+
+from __future__ import annotations
+from typing import Dict, Any, Set
+from .llm_client import chat_json
+
+DESCRIPTION_VALIDATOR_SYSTEM = """
+You validate Java class documentation.
+
+Input JSON:
+{
+  "skeleton": {...},    // AST-based class skeleton (name, fields, methods, innerClasses)
+  "doc": {...}          // generated documentation components
+}
+
+Return JSON:
+{
+  "accuracy_percentage": 95.0,
+  "completeness_percentage": 90.0,
+  "explanation": "short explanation of gaps or misalignments"
+}
+Accuracy: how well descriptions match the intent implied by names and structure.
+Completeness: how much of the skeleton is covered (fields, methods, inner classes).
+Be conservative; do not give 100 unless you are confident it is exact.
+"""
+
+def skeleton_metrics(type_obj: Dict[str, Any], doc: Dict[str, Any]) -> Dict[str, Any]:
+    ast_fields: Set[str] = {f["name"] for f in type_obj.get("fields", [])}
+    ast_methods: Set[str] = {m["name"] for m in type_obj.get("methods", [])}
+
+    doc_fields: Set[str] = set()
+    doc_methods: Set[str] = set()
+    for comp in doc.get("components", []):
+        for f in comp.get("fields", []):
+            doc_fields.add(f.get("name", ""))
+        for m in comp.get("methods", []):
+            doc_methods.add(m.get("name", ""))
+
+    total_fields = len(ast_fields) or 1
+    total_methods = len(ast_methods) or 1
+
+    fields_cov = len(ast_fields & doc_fields) / total_fields
+    methods_cov = len(ast_methods & doc_methods) / total_methods
+
+    total = (fields_cov + methods_cov) / 2.0
+
+    return {
+        "total_fields": len(ast_fields),
+        "fields_completeness_score": fields_cov * 100,
+        "total_methods": len(ast_methods),
+        "methods_completeness_score": methods_cov * 100,
+        "total_completeness_percentage": total * 100,
+    }
+
+
+def validate_doc_against_ast(type_obj: Dict[str, Any], doc: Dict[str, Any]) -> Dict[str, Any]:
+    skeleton = skeleton_metrics(type_obj, doc)
+    payload = {"skeleton": type_obj, "doc": doc}
+    desc = chat_json(DESCRIPTION_VALIDATOR_SYSTEM, payload, max_tokens=800)
+
+    description = {
+        "accuracy_percentage": desc.get("accuracy_percentage", 0.0),
+        "completeness_percentage": desc.get("completeness_percentage", 0.0),
+        "explanation": desc.get("explanation", ""),
+    }
+    return {
+        "skeleton_validation": skeleton,
+        "description_validation": description,
+    }
+
+================
+backend/doc_generator.py (per-class doc generation + validation + retry)
+
+from __future__ import annotations
+import json
+from typing import Any, Dict
+from .chunker import summarise_method
+from .validator import validate_doc_against_ast
+from .config import DOC_AUTO_RETRY, DOC_VALIDATION_THRESHOLD
+from .llm_client import chat_json
+
+DOC_SYSTEM_PROMPT = """
+You generate documentation for a single Java class.
+
+Input JSON:
+{
+  "skeleton": {
+    "className": "...",
+    "kind": "...",
+    "modifiers": "...",
+    "fields": [{"name":"...","type":"...","modifiers":"..."}],
+    "methods": [
+        {"name":"...","returnType":"...","modifiers":"...","parameters":[{"name":"...","type":"..."}]}
+    ],
+    "innerClasses": [ { ... nested skeletons ... } ]
+  },
+  "methods": [
+    {
+      "name":"...",
+      "summary":"short description of method behaviour",
+      "parameters":[{"name":"...","type":"..."}],
+      "returnType":"..."
+    }
+  ]
+}
+
+Output JSON format (strict):
+{
+  "components":[
+    {
+      "name":"<className>",
+      "description":"high level description",
+      "fields":[{"name":"...","type":"...","description":"..."}],
+      "methods":[
+        {
+          "name":"...",
+          "description":"...",
+          "parameters":[{"name":"...","type":"...","description":"..."}],
+          "return":{"type":"...","description":"..."}
+        }
+      ]
+    }
+  ]
+}
+Do not invent classes, fields or methods that are not in the skeleton.
+"""
+
+def build_skeleton(type_obj: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "className": type_obj["name"],
+        "kind": type_obj.get("kind", ""),
+        "modifiers": type_obj.get("modifiers", ""),
+        "fields": type_obj.get("fields", []),
+        "methods": [
+            {
+                "name": m.get("name"),
+                "returnType": m.get("returnType"),
+                "modifiers": m.get("modifiers"),
+                "parameters": m.get("parameters", []),
+            }
+            for m in type_obj.get("methods", [])
+        ],
+        "innerClasses": [build_skeleton(ic) for ic in type_obj.get("innerClasses", [])],
+    }
+
+
+def generate_documentation_for_type(type_obj: Dict[str, Any]) -> Dict[str, Any]:
+    attempts = 0
+    best = None
+    best_score = -1.0
+
+    while attempts <= DOC_AUTO_RETRY:
+        attempts += 1
+
+        method_docs = []
+        for m in type_obj.get("methods", []):
+            ms = summarise_method(type_obj["name"], m)
+            method_docs.append(
+                {
+                    "name": ms.method_name,
+                    "summary": ms.description,
+                    "parameters": ms.signature.get("parameters", []),
+                    "returnType": ms.signature.get("returnType"),
+                }
+            )
+
+        payload = {"skeleton": build_skeleton(type_obj), "methods": method_docs}
+        doc_json = chat_json(DOC_SYSTEM_PROMPT, payload, max_tokens=1400)
+
+        validation = validate_doc_against_ast(type_obj, doc_json)
+        score = (
+            validation["skeleton_validation"]["total_completeness_percentage"]
+            + validation["description_validation"]["accuracy_percentage"]
+            + validation["description_validation"]["completeness_percentage"]
+        ) / 300.0  # normalise 0–1
+
+        if score > best_score:
+            best_score = score
+            best = {"doc": doc_json, "validation": validation}
+
+        if score >= DOC_VALIDATION_THRESHOLD:
+            break
+
+    return best
+
+==================
+backend/converter.py (documentation-first Spring Boot generation)
+
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple
+import base64
+from pathlib import Path
+from .llm_client import chat_json
+
+CONVERTER_SYSTEM_PROMPT = """
+You convert Java class documentation into Spring Boot Java 11 code.
+
+Input: the documentation JSON with "components" for one class.
+
+Output JSON:
+{
+  "files":[{"path":"src/main/java/.../SomeClass.java","content":"<base64>"}],
+  "notes":"short explanation",
+  "pom":"<base64-encoded pom.xml or empty string>"
+}
+
+Rules:
+- Use Java 11.
+- Use Spring Boot 3.x style annotations.
+- Do NOT use Lombok.
+- Only use information contained in the documentation. If something is missing, keep code minimal and leave TODO comments.
+"""
+
+def convert_doc_to_spring(doc: Dict[str, Any]) -> Dict[str, Any]:
+    j = chat_json(CONVERTER_SYSTEM_PROMPT, doc, max_tokens=2200)
+    files: List[Tuple[str, str]] = []
+    for f in j.get("files", []):
+        path = f.get("path")
+        try:
+            content = base64.b64decode(f.get("content", "")).decode("utf-8")
+        except Exception:
+            content = f.get("content", "")
+        files.append((path, content))
+
+    pom_content = ""
+    if "pom" in j:
+        try:
+            pom_content = base64.b64decode(j["pom"]).decode("utf-8")
+        except Exception:
+            pom_content = j["pom"]
+
+    return {"files": files, "pom": pom_content, "notes": j.get("notes", "")}
+
+===≈==============
+
+backend/test_generator.py (JUnit from docs)
+
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple
+import base64
+from .llm_client import chat_json
+
+TEST_SYSTEM_PROMPT = """
+You generate JUnit 5 tests for Spring Boot code based on the documentation JSON.
+
+Output JSON:
+{"tests":[{"path":"src/test/java/.../SomeClassTest.java","content":"<base64>"}]}
+"""
+
+def generate_tests(doc: Dict[str, Any]) -> List[Tuple[str, str]]:
+    j = chat_json(TEST_SYSTEM_PROMPT, doc, max_tokens=1600)
+    tests: List[Tuple[str, str]] = []
+    for t in j.get("tests", []):
+        path = t.get("path")
+        try:
+            content = base64.b64decode(t.get("content", "")).decode("utf-8")
+        except Exception:
+            content = t.get("content", "")
+        tests.append((path, content))
+    return tests
+
+==================
+4. Streamlit app (multi-class, UI similar to your screenshots)
+
+from __future__ import annotations
+import json
+import os
+from pathlib import Path
+from typing import Dict, Any
+
+import pandas as pd
+import streamlit as st
+
+from backend.config import (
+    AST_JSON_PATH,
+    PREPROCESSED_JSON,
+    DATA_DIR,
+    LEGACY_REPO_ENV,
+)
+from backend.ast_extractor import load_ast, run_java_extractor
+from backend.chunker import flatten_types
+from backend.doc_generator import generate_documentation_for_type
+from backend.converter import convert_doc_to_spring
+from backend.test_generator import generate_tests
+
+# ---------- bootstrap ----------
+
+st.set_page_config(page_title="Code Conversion Tool", layout="wide")
+st.title("Code Conversion Tool")
+
+repo_path = os.getenv(LEGACY_REPO_ENV)
+if not repo_path:
+    st.error(f"Set environment variable {LEGACY_REPO_ENV} to your legacy Java repo path.")
+    st.stop()
+
+if not AST_JSON_PATH.exists():
+    with st.spinner("Running JavaParser extractor (one-time)..."):
+        run_java_extractor(repo_path)
+
+# cached AST for all pages
+@st.cache_data
+def get_ast() -> Dict[str, Any]:
+    return load_ast()
+
+ast = get_ast()
+
+# preprocessed docs + metrics
+def load_pre() -> Dict[str, Any]:
+    if PREPROCESSED_JSON.exists():
+        return json.loads(PREPROCESSED_JSON.read_text(encoding="utf-8"))
+    return {"generation_details": {}}
+
+def save_pre(data: Dict[str, Any]):
+    PREPROCESSED_JSON.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+pre = load_pre()
+
+# flatten all types (top-level + inner)
+all_types = flatten_types(ast)
+
+# ---------- sidebar: class selection ----------
+
+type_names = [t["qualified_name"] for t in all_types]
+selected = st.sidebar.selectbox("Select Class", type_names)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Generate docs for ALL classes"):
+    with st.spinner("Generating documentation for all classes... this may take a while."):
+        for t in all_types:
+            qname = t["qualified_name"]
+            if qname in pre["generation_details"]:
+                continue
+            result = generate_documentation_for_type(t["type_obj"])
+            pre["generation_details"][qname] = result
+        save_pre(pre)
+    st.sidebar.success("Docs generated for all classes.")
+
+
+# ---------- main grid: table + detail ----------
+
+left, right = st.columns([1.2, 1.8])
+
+with left:
+    st.subheader("Legacy Code Classes")
+
+    rows = []
+    for t in all_types:
+        qname = t["qualified_name"]
+        info = pre["generation_details"].get(qname)
+        status = "Generated" if info else "Pending"
+        completeness = ""
+        if info:
+            s = info["validation"]["skeleton_validation"]["total_completeness_percentage"]
+            dacc = info["validation"]["description_validation"]["accuracy_percentage"]
+            dcomp = info["validation"]["description_validation"]["completeness_percentage"]
+            completeness = f"{(s + dacc + dcomp) / 3.0:.1f}%"
+        rows.append(
+            {
+                "Qualified Class": qname,
+                "File": t["file"],
+                "Doc Status": status,
+                "Doc Quality": completeness,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True)
+
+with right:
+    st.subheader(f"Documentation: {selected}")
+
+    selected_type = next(t for t in all_types if t["qualified_name"] == selected)
+
+    if selected not in pre["generation_details"]:
+        if st.button("Generate documentation"):
+            with st.spinner("Generating documentation via Azure OpenAI..."):
+                result = generate_documentation_for_type(selected_type["type_obj"])
+                pre["generation_details"][selected] = result
+                save_pre(pre)
+            st.experimental_rerun()
+        else:
+            st.info("Documentation not generated yet. Click the button above.")
+    else:
+        details = pre["generation_details"][selected]
+        doc_json = details["doc"]
+        validation = details["validation"]
+
+        # top buttons
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Re-generate documentation"):
+                with st.spinner("Re-generating documentation..."):
+                    result = generate_documentation_for_type(selected_type["type_obj"])
+                    pre["generation_details"][selected] = result
+                    save_pre(pre)
+                st.experimental_rerun()
+        with b2:
+            if st.button("Convert to Spring & Generate Tests"):
+                with st.spinner("Generating Spring Boot code..."):
+                    conv = convert_doc_to_spring(doc_json)
+                out_dir = DATA_DIR.parent / "generated"
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                # write pom once if provided
+                if conv["pom"]:
+                    (out_dir / "pom.xml").write_text(conv["pom"], encoding="utf-8")
+                for path, content in conv["files"]:
+                    p = out_dir / path
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+
+                with st.spinner("Generating tests..."):
+                    tests = generate_tests(doc_json)
+                for path, content in tests:
+                    p = out_dir / path
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+
+                st.success(
+                    f"Generated {len(conv['files'])} Spring files and {len(tests)} tests into {out_dir}."
+                )
+                if conv["notes"]:
+                    st.write("Notes from generator:")
+                    st.write(conv["notes"])
+
+        st.markdown("### Documentation JSON")
+        st.json(doc_json)
+
+        st.markdown("### Validation Metrics")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("Skeleton Validation")
+            st.json(validation["skeleton_validation"])
+        with col2:
+            st.write("Description Validation")
+            st.json(validation["description_validation"])
+
+==============
+===============================================================
+
+
