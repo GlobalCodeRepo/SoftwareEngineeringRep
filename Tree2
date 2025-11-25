@@ -1,3 +1,9 @@
+set AZURE_OPENAI_KEY=YOUR_KEY
+set AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
+set AZURE_DEPLOYMENT_CHAT=<your-chat-deployment>
+set AZURE_DEPLOYMENT_EMBED=<your-embed-deployment>
+set LEGACY_JAVA_REPO=C:\path\to\your\legacy_java_repo
+
 Project Structure (0)
 
 code_conversion_workspace/
