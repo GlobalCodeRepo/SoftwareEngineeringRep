@@ -1,4 +1,11 @@
-
+print("DEBUG ENV:", {
+    "key_exists": os.getenv("AZURE_OPENAI_API_KEY") is not None,
+    "endpoint": os.getenv("AZURE_OPENAI_ENDPOINT"),
+    "chat": os.getenv("AZURE_DEPLOYMENT_CHAT"),
+    "embed": os.getenv("AZURE_DEPLOYMENT_EMBED"),
+    "api_version": os.getenv("API_VERSION"),
+})
+==============
 package extractor;
 
 import com.github.javaparser.*;
