@@ -1773,3 +1773,259 @@ with right:
                     "comments": validation["comments"],
                 }
             )
+
+====================================================
+final updated app.py
+
+from __future__ import annotations
+import json
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+from typing import Dict, Any
+
+import pandas as pd
+import streamlit as st
+
+from backend.config import AST_JSON_PATH, PREPROCESSED_JSON, DATA_DIR, LEGACY_REPO_ENV
+from backend.ast_extractor import load_ast, run_java_extractor
+from backend.chunker import build_segments, Segment
+from backend.doc_generator import generate_documentation_for_segment
+from backend.converter import convert_doc_to_spring
+from backend.test_generator import generate_tests
+
+load_dotenv()
+
+st.set_page_config(page_title="Legacy → SpringBoot Converter", layout="wide")
+st.title("Legacy Code Conversion Tool (Multi-Module Segmentation)")
+
+# --- environment check ---
+repo_path = os.getenv(LEGACY_REPO_ENV)
+if not repo_path:
+    st.error(f"Set environment variable {LEGACY_REPO_ENV} to your legacy Java repo path.")
+    st.stop()
+
+repo_path = str(Path(repo_path).resolve())
+st.sidebar.markdown(f"**Legacy repo:** `{repo_path}`")
+
+if not AST_JSON_PATH.exists():
+    with st.spinner("Running JavaParser extractor for the first time..."):
+        run_java_extractor(repo_path)
+
+
+@st.cache_data
+def get_ast() -> Dict[str, Any]:
+    return load_ast()
+
+
+@st.cache_data
+def get_segments() -> Dict[str, Segment]:
+    ast = get_ast()
+    seg_list = build_segments(ast)
+    return {seg.segment_id: seg for seg in seg_list}
+
+
+def load_pre() -> Dict[str, Any]:
+    if PREPROCESSED_JSON.exists():
+        return json.loads(PREPROCESSED_JSON.read_text(encoding="utf-8"))
+    return {"generation_details": {}}
+
+
+def save_pre(data: Dict[str, Any]):
+    PREPROCESSED_JSON.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+segments = get_segments()
+pre = load_pre()
+
+segment_ids = list(segments.keys())
+if not segment_ids:
+    st.error("No segments found in AST. Check that your legacy repo contains .java files.")
+    st.stop()
+
+# Sidebar selector for detail view (kept from old working version)
+selected_id = st.sidebar.selectbox("Select Module Segment", segment_ids)
+
+# Layout: left = overview table with actions, right = detail panel
+left, right = st.columns([1.4, 1.6])
+
+# -------------------------------------------------------------------
+# LEFT: MAIN TABLE WITH ACTION BUTTONS
+# -------------------------------------------------------------------
+with left:
+    st.subheader("Segments (Modules)")
+
+    # Header row
+    h1, h2, h3, h4, h5, h6, h7 = st.columns([3, 2, 2, 2, 1.5, 1.5, 3])
+    h1.markdown("**Segment ID**")
+    h2.markdown("**Module**")
+    h3.markdown("**Origin Class**")
+    h4.markdown("**File**")
+    h5.markdown("**Doc Status**")
+    h6.markdown("**Doc Quality**")
+    h7.markdown("**Actions**")
+
+    st.markdown("---")
+
+    # One row per segment with buttons
+    for seg_id, seg in segments.items():
+        info = pre["generation_details"].get(seg_id)
+        status = "Generated" if info else "Pending"
+        quality = ""
+        if info:
+            v = info["validation"]
+            cov = v["method_coverage_percentage"]
+            qual = v["description_quality_estimate"]
+            quality = f"{(cov + qual) / 2.0:.1f}%"
+
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([3, 2, 2, 2, 1.5, 1.5, 3])
+
+        with c1:
+            # Shorten segment id for display
+            st.caption(seg_id)
+
+        with c2:
+            st.write(seg.module_name)
+
+        with c3:
+            st.write(seg.origin_class)
+
+        with c4:
+            st.write(seg.file_path)
+
+        with c5:
+            st.write(status)
+
+        with c6:
+            st.write(quality or "-")
+
+        with c7:
+            # Buttons are per-row; keys must be unique
+            col_doc, col_spring = st.columns(2)
+
+            with col_doc:
+                if st.button("Doc", key=f"doc_{seg_id}"):
+                    with st.spinner(f"Generating documentation for {seg.module_name}..."):
+                        result = generate_documentation_for_segment(seg)
+                        pre["generation_details"][seg_id] = result
+                        save_pre(pre)
+                    st.rerun()
+
+            with col_spring:
+                spring_disabled = seg_id not in pre["generation_details"]
+                if st.button("Spring+Tests", key=f"spring_{seg_id}", disabled=spring_disabled):
+                    if spring_disabled:
+                        st.warning("Generate documentation first.")
+                    else:
+                        details = pre["generation_details"][seg_id]
+                        doc = details["doc"]
+                        with st.spinner(f"Generating Spring Boot code for {seg.module_name}..."):
+                            conv = convert_doc_to_spring(doc)
+
+                        out_dir = DATA_DIR.parent / "generated"
+                        out_dir.mkdir(parents=True, exist_ok=True)
+
+                        if conv["pom"]:
+                            (out_dir / "pom.xml").write_text(conv["pom"], encoding="utf-8")
+                        for path, content in conv["files"]:
+                            p = out_dir / path
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            p.write_text(content, encoding="utf-8")
+
+                        with st.spinner(f"Generating tests for {seg.module_name}..."):
+                            tests = generate_tests(doc)
+                        for path, content in tests:
+                            p = out_dir / path
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            p.write_text(content, encoding="utf-8")
+
+                        st.success(
+                            f"[{seg.module_name}] Generated {len(conv['files'])} Spring Boot files "
+                            f"and {len(tests)} tests under `{out_dir}`."
+                        )
+                        if conv.get("notes"):
+                            st.write("Notes from generator:")
+                            st.write(conv["notes"])
+
+        st.markdown("---")
+
+# -------------------------------------------------------------------
+# RIGHT: DETAIL PANEL (same behaviour as your old working app.py)
+# -------------------------------------------------------------------
+with right:
+    seg = segments[selected_id]
+    st.subheader(f"Module: {seg.module_name}")
+    st.caption(f"Origin class: {seg.origin_class}  •  File: {seg.file_path}")
+    st.write(f"**LLM-inferred purpose:** {seg.module_purpose or '(not set)'}")
+
+    if selected_id not in pre["generation_details"]:
+        if st.button("Generate Documentation for this Module"):
+            with st.spinner("Generating documentation via Azure OpenAI..."):
+                result = generate_documentation_for_segment(seg)
+                pre["generation_details"][selected_id] = result
+                save_pre(pre)
+            st.rerun()
+        else:
+            st.info("Documentation not generated yet. Click any 'Doc' button in the table or the button above.")
+    else:
+        details = pre["generation_details"][selected_id]
+        doc = details["doc"]
+        validation = details["validation"]
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Re-Generate Documentation"):
+                with st.spinner("Re-generating documentation..."):
+                    result = generate_documentation_for_segment(seg)
+                    pre["generation_details"][selected_id] = result
+                    save_pre(pre)
+                st.rerun()
+        with b2:
+            if st.button("Convert to Spring Boot & Generate Tests"):
+                with st.spinner("Generating Spring Boot code..."):
+                    conv = convert_doc_to_spring(doc)
+                out_dir = DATA_DIR.parent / "generated"
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                if conv["pom"]:
+                    (out_dir / "pom.xml").write_text(conv["pom"], encoding="utf-8")
+                for path, content in conv["files"]:
+                    p = out_dir / path
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+
+                with st.spinner("Generating tests..."):
+                    tests = generate_tests(doc)
+                for path, content in tests:
+                    p = out_dir / path
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+
+                st.success(
+                    f"Generated {len(conv['files'])} Spring Boot files and {len(tests)} tests under `{out_dir}`."
+                )
+                if conv.get("notes"):
+                    st.write("Notes from generator:")
+                    st.write(conv["notes"])
+
+        st.markdown("### Documentation JSON")
+        st.json(doc)
+
+        st.markdown("### Validation")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("Coverage & Quality")
+            st.json(
+                {
+                    "method_coverage_percentage": validation["method_coverage_percentage"],
+                    "description_quality_estimate": validation["description_quality_estimate"],
+                }
+            )
+        with c2:
+            st.write("Missing Methods / Comments")
+            st.json(
+                {
+                    "missing_methods": validation["missing_methods"],
+                    "comments": validation["comments"],
+                }
+            )
