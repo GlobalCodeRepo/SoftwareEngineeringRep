@@ -1,1 +1,690 @@
 
+1. Configuration – backend/config.py
+
+# backend/config.py
+from __future__ import annotations
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+(AST_JSON_PATH := DATA_DIR / "ast.json").parent.mkdir(exist_ok=True, parents=True)
+
+DOCS_DIR = BASE_DIR / "docs"
+DOCS_DIR.mkdir(exist_ok=True)
+
+CHUNK_DB_PATH = DATA_DIR / "chunk_embeddings.json"
+PREPROCESSED_JSON = DATA_DIR / "preprocessed_files.json"
+
+LEGACY_REPO_ENV = "LEGACY_REPO_PATH"  # read from env in Streamlit
+DEFAULT_LEGACY_REPO = PROJECT_ROOT / "legacy_java_repo"
+
+GENERATED_SRC_DIR = BASE_DIR / "generated" / "src" / "main" / "java"
+GENERATED_TEST_DIR = BASE_DIR / "generated" / "src" / "test" / "java"
+
+CHUNK_SIZE_LINES = 160
+OVERLAP_LINES = 40
+
+DOC_VALIDATION_THRESHOLD = 0.9
+DOC_MAX_REGENERATIONS = 1
+
+==============≈===========================================================================
+2. Azure OpenAI client – backend/llm_client.py
+
+# backend/llm_client.py
+from __future__ import annotations
+import os
+import json
+from typing import Any, Dict, List
+from openai import AzureOpenAI
+
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT")
+AZURE_DEPLOYMENT_EMBED = os.getenv("AZURE_DEPLOYMENT_EMBED", "text-embedding-3-small")
+API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=API_VERSION,
+)
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    resp = client.embeddings.create(
+        model=AZURE_DEPLOYMENT_EMBED,
+        input=texts,
+    )
+    return [e.embedding for e in resp.data]
+
+def chat_json(system_prompt: str, user_payload: Any, max_tokens: int = 2000) -> Dict[str, Any]:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_CHAT,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload)},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.1,
+    )
+    text = resp.choices[0].message.content
+    try:
+        return json.loads(text)
+    except Exception:
+        # try to salvage JSON substring
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(text[start : end + 1])
+        raise
+
+===================================================================================
+
+3. JavaParser helper – java_parser_helper (Java)
+
+You already have this built and working (we fixed the parsing issues earlier). The only extra requirement for chunking is:
+include beginLine / endLine for:
+each type (class / enum / interface)
+each method, constructor, field declaration (optionally)
+A very small sketch of the important part of Extractor.java:
+
+
+// src/main/java/extractor/Extractor.java  (snippet)
+private static JsonObject typeToJson(TypeDeclaration<?> type) {
+    JsonObject obj = new JsonObject();
+    obj.addProperty("name", type.getNameAsString());
+    obj.addProperty("kind", type.getClass().getSimpleName());
+    obj.add("range", rangeToJson(type.getRange().orElse(null)));
+
+    JsonArray methods = new JsonArray();
+    for (MethodDeclaration m : type.getMethods()) {
+        JsonObject mj = new JsonObject();
+        mj.addProperty("name", m.getNameAsString());
+        mj.addProperty("signature", m.getDeclarationAsString());
+        mj.add("range", rangeToJson(m.getRange().orElse(null)));
+        methods.add(mj);
+    }
+    obj.add("methods", methods);
+
+    JsonArray inner = new JsonArray();
+    for (BodyDeclaration<?> member : type.getMembers()) {
+        if (member.isTypeDeclaration()) {
+            inner.add(typeToJson(member.asTypeDeclaration()));
+        }
+    }
+    obj.add("innerClasses", inner);
+    return obj;
+}
+
+===========
+
+Output shape (simplified):
+
+{
+  "files": [
+    {
+      "path": "MainApplication.java",
+      "types": [
+        {
+          "name": "MainApplication",
+          "range": {"beginLine":1,"endLine":4800},
+          "methods": [...],
+          "innerClasses":[ { "name":"ChequeProcessor", ... }, ... ]
+        }
+      ]
+    }
+  ]
+}
+
+=================================================================================
+
+4. AST extractor wrapper – backend/ast_extractor.py
+
+# backend/ast_extractor.py
+from __future__ import annotations
+import json
+import subprocess
+from pathlib import Path
+from typing import Dict, Any
+
+from .config import AST_JSON_PATH, PROJECT_ROOT, DEFAULT_LEGACY_REPO
+
+def run_java_extractor(
+    repo_path: Path | None = None,
+    ast_path: Path = AST_JSON_PATH,
+) -> Dict[str, Any]:
+    """
+    Runs the JavaParser extractor jar over the repo and writes ast.json.
+    Assumes java_parser_helper/target/javaparser-extractor-...-jar-with-dependencies.jar exists.
+    """
+    repo_path = repo_path or DEFAULT_LEGACY_REPO
+    jar_dir = PROJECT_ROOT / "java_parser_helper" / "target"
+    jars = list(jar_dir.glob("javaparser-extractor-*-jar-with-dependencies.jar"))
+    if not jars:
+        raise RuntimeError("Extractor jar not found, run `mvn -q clean package` in java_parser_helper")
+
+    jar = jars[0]
+    ast_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["java", "-jar", str(jar), str(repo_path), str(ast_path)]
+    subprocess.run(cmd, check=True)
+    with ast_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def load_ast(ast_path: Path = AST_JSON_PATH) -> Dict[str, Any]:
+    with ast_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+====================================================================================
+
+5. RAG chunker – backend/chunker.py
+
+# backend/chunker.py
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Dict, Any
+
+import json
+
+from .config import CHUNK_SIZE_LINES, OVERLAP_LINES, CHUNK_DB_PATH
+from .llm_client import embed_texts
+
+@dataclass
+class Chunk:
+    id: str
+    file_path: str
+    start_line: int
+    end_line: int
+    source_code: str
+    classes: List[str]
+    methods: List[str]
+    prev_id: str | None = None
+    next_id: str | None = None
+
+def _lines_for_range(lines: List[str], start: int, end: int) -> str:
+    return "\n".join(lines[start - 1 : end])
+
+def build_chunks_for_file(
+    ast: Dict[str, Any],
+    file_path: Path,
+    chunk_size: int = CHUNK_SIZE_LINES,
+    overlap: int = OVERLAP_LINES,
+) -> List[Chunk]:
+    """
+    Build overlapping line-based chunks for a single Java file.
+    Each chunk knows which classes/methods appear in it (by name).
+    """
+    text = file_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    n_lines = len(lines)
+
+    # Find the AST entry for this file
+    file_entry = next(
+        (f for f in ast["files"] if Path(f["path"]).name == file_path.name),
+        None,
+    )
+    if not file_entry:
+        raise ValueError(f"No AST info for file {file_path}")
+
+    types = file_entry.get("types", [])
+    chunks: List[Chunk] = []
+
+    start = 1
+    idx = 0
+    while start <= n_lines:
+        end = min(n_lines, start + chunk_size - 1)
+        chunk_text = _lines_for_range(lines, start, end)
+
+        # Which classes / methods overlap this range?
+        class_names: List[str] = []
+        method_names: List[str] = []
+        for t in types:
+            tr = t.get("range") or {}
+            tb, te = tr.get("beginLine", 1), tr.get("endLine", n_lines)
+            if not (te < start or tb > end):
+                class_names.append(t["name"])
+                for m in t.get("methods", []):
+                    mr = m.get("range") or {}
+                    mb, me = mr.get("beginLine", tb), mr.get("endLine", te)
+                    if not (me < start or mb > end):
+                        method_names.append(m["name"])
+
+        cid = f"{file_path.name}::chunk_{idx}"
+        chunks.append(
+            Chunk(
+                id=cid,
+                file_path=file_path.name,
+                start_line=start,
+                end_line=end,
+                source_code=chunk_text,
+                classes=sorted(set(class_names)),
+                methods=sorted(set(method_names)),
+            )
+        )
+
+        idx += 1
+        if end == n_lines:
+            break
+        start = end - overlap + 1  # overlap
+
+    # link neighbours
+    for i, ch in enumerate(chunks):
+        if i > 0:
+            ch.prev_id = chunks[i - 1].id
+        if i < len(chunks) - 1:
+            ch.next_id = chunks[i + 1].id
+
+    return chunks
+
+def persist_chunk_embeddings(chunks: List[Chunk]) -> None:
+    texts = [c.source_code for c in chunks]
+    embeddings = embed_texts(texts)
+
+    db_records = []
+    for ch, emb in zip(chunks, embeddings):
+        db_records.append(
+            {
+                "id": ch.id,
+                "file_path": ch.file_path,
+                "start_line": ch.start_line,
+                "end_line": ch.end_line,
+                "classes": ch.classes,
+                "methods": ch.methods,
+                "embedding": emb,
+            }
+        )
+
+    CHUNK_DB_PATH.write_text(json.dumps(db_records, indent=2), encoding="utf-8")
+
+def load_chunk_db() -> List[Dict[str, Any]]:
+    if not CHUNK_DB_PATH.exists():
+        return []
+    return json.loads(CHUNK_DB_PATH.read_text(encoding="utf-8"))
+
+===========================================================================≈===========
+
+6. Documentation generator (per chunk → per class) – backend/doc_generator.py
+
+# backend/doc_generator.py
+from __future__ import annotations
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+
+from .chunker import Chunk
+from .config import DOCS_DIR, DOC_VALIDATION_THRESHOLD, DOC_MAX_REGENERATIONS, DATA_DIR
+from .llm_client import chat_json
+
+CHUNK_DOC_DIR = DATA_DIR / "docs" / "chunk_docs"
+CHUNK_DOC_DIR.mkdir(parents=True, exist_ok=True)
+
+def _doc_system_prompt() -> str:
+    return (
+        "You are documenting legacy Java 11 code so it can be re-implemented as "
+        "Spring Boot microservices. For a given code CHUNK you must:\n"
+        "- Produce STRICT JSON.\n"
+        "- Only describe classes and methods that appear in this chunk.\n"
+        "- Use this schema:\n"
+        "{'classes':[{'name':str,'description':str,'role':str,"
+        "'fields':[{'name':str,'type':str,'description':str}],"
+        "'methods':[{'name':str,'signature':str,'description':str,"
+        "'parameters':[{'name':str,'type':str,'description':str}],"
+        "'returns':str}],'inner_classes':[...same schema...]}]}"
+    )
+
+def _validation_system_prompt() -> str:
+    return (
+        "You are validating documentation for a Java code chunk.\n"
+        "Inputs:\n"
+        "- source_code: raw Java code for the chunk.\n"
+        "- ast_fragment: JSON subset of the AST (classes, methods, ranges) that intersect this chunk.\n"
+        "- doc: documentation JSON produced from this chunk (see schema).\n"
+        "You must:\n"
+        "- Check ACCURACY: are descriptions logically consistent with the code & AST?\n"
+        "- Check COVERAGE: are all classes/methods in ast_fragment present in doc?\n"
+        "- Check DESCRIPTION_QUALITY: clarity and usefulness of descriptions.\n"
+        "Return STRICT JSON:\n"
+        "{'accuracy': float (0..1),"
+        " 'coverage': float (0..1),"
+        " 'description_quality': float (0..1),"
+        " 'overall': float (0..1),"
+        " 'issues': [{'type':str,'detail':str}]}"
+    )
+
+def _ast_fragment_for_chunk(ast_file_entry: Dict[str, Any], chunk: Chunk) -> Dict[str, Any]:
+    frag_types: List[Dict[str, Any]] = []
+    for t in ast_file_entry.get("types", []):
+        tr = t.get("range") or {}
+        tb, te = tr.get("beginLine", 1), tr.get("endLine", 10**9)
+        if te < chunk.start_line or tb > chunk.end_line:
+            continue
+        t_copy = {k: v for k, v in t.items() if k != "innerClasses"}
+        # filter methods
+        methods = []
+        for m in t.get("methods", []):
+            mr = m.get("range") or {}
+            mb, me = mr.get("beginLine", tb), mr.get("endLine", te)
+            if me < chunk.start_line or mb > chunk.end_line:
+                continue
+            methods.append(m)
+        t_copy["methods"] = methods
+        frag_types.append(t_copy)
+    return {"path": ast_file_entry["path"], "types": frag_types}
+
+def generate_doc_for_chunk(
+    chunk: Chunk,
+    ast_file_entry: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Returns (doc_json, validation_result_json)
+    """
+    ast_frag = _ast_fragment_for_chunk(ast_file_entry, chunk)
+
+    attempts = 0
+    best_doc: Dict[str, Any] | None = None
+    best_val: Dict[str, Any] | None = None
+
+    while attempts <= DOC_MAX_REGENERATIONS:
+        user_payload = {
+            "file": chunk.file_path,
+            "chunk_id": chunk.id,
+            "start_line": chunk.start_line,
+            "end_line": chunk.end_line,
+            "classes_in_chunk": chunk.classes,
+            "methods_in_chunk": chunk.methods,
+            "source_code": chunk.source_code,
+        }
+        doc = chat_json(_doc_system_prompt(), user_payload)
+        val = chat_json(
+            _validation_system_prompt(),
+            {"source_code": chunk.source_code, "ast_fragment": ast_frag, "doc": doc},
+        )
+
+        overall = float(val.get("overall", 0.0))
+        if best_val is None or overall > float(best_val.get("overall", 0.0)):
+            best_doc, best_val = doc, val
+
+        if overall >= DOC_VALIDATION_THRESHOLD:
+            break
+        attempts += 1
+
+    assert best_doc is not None and best_val is not None
+    return best_doc, best_val
+
+def persist_chunk_doc(chunk: Chunk, doc: Dict[str, Any], val: Dict[str, Any]) -> None:
+    fdir = CHUNK_DOC_DIR / Path(chunk.file_path).stem
+    fdir.mkdir(parents=True, exist_ok=True)
+    out_path = fdir / f"{chunk.id.replace('::','_')}.json"
+    out_path.write_text(json.dumps({"doc": doc, "validation": val}, indent=2), encoding="utf-8")
+
+def load_all_chunk_docs(file_name: str) -> List[Dict[str, Any]]:
+    fdir = CHUNK_DOC_DIR / Path(file_name).stem
+    if not fdir.exists():
+        return []
+    docs = []
+    for p in sorted(fdir.glob("*.json")):
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        obj["chunk_file"] = p.name
+        docs.append(obj)
+    return docs
+
+def collate_docs_to_classes(file_name: str, chunk_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Merge per-chunk docs into per-class documentation.
+    Inner-most classes are merged first; outer classes aggregate them.
+    """
+    classes_by_name: Dict[str, Dict[str, Any]] = {}
+
+    for cd in chunk_docs:
+        doc = cd["doc"]
+        val = cd["validation"]
+        overall = float(val.get("overall", 0.0))
+        for c in doc.get("classes", []):
+            name = c["name"]
+            existing = classes_by_name.get(name)
+            if existing is None or overall > float(existing.get("_best_score", 0.0)):
+                c["_best_score"] = overall
+                classes_by_name[name] = c
+            else:
+                # merge methods/fields if new ones appear
+                existing_methods = {m["name"]: m for m in existing.get("methods", [])}
+                for m in c.get("methods", []):
+                    if m["name"] not in existing_methods:
+                        existing["methods"].append(m)
+                existing_fields = {f["name"]: f for f in existing.get("fields", [])}
+                for f in c.get("fields", []):
+                    if f["name"] not in existing_fields:
+                        existing["fields"].append(f)
+
+    # strip helper field
+    for c in classes_by_name.values():
+        c.pop("_best_score", None)
+
+    result = {"file": file_name, "classes": list(classes_by_name.values())}
+
+    out_path = DOCS_DIR / f"{Path(file_name).stem}.json"
+    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+========
+Usage from orchestration:
+
+def generate_documentation_for_file(ast: Dict[str, Any], file_path: Path) -> Dict[str, Any]:
+    from .chunker import build_chunks_for_file, persist_chunk_embeddings
+
+    file_entry = next(f for f in ast["files"] if Path(f["path"]).name == file_path.name)
+    chunks = build_chunks_for_file(ast, file_path)
+    persist_chunk_embeddings(chunks)
+
+    chunk_docs = []
+    for ch in chunks:
+        doc, val = generate_doc_for_chunk(ch, file_entry)
+        persist_chunk_doc(ch, doc, val)
+        chunk_docs.append({"doc": doc, "validation": val})
+
+    return collate_docs_to_classes(file_path.name, chunk_docs)
+
+================================================================================
+7. Generate Spring Boot code – backend/converter.py
+
+# backend/converter.py
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import Dict, Any, List
+
+from .config import GENERATED_SRC_DIR
+from .llm_client import chat_json
+from .chunker import load_chunk_db
+
+def _spring_system_prompt() -> str:
+    return (
+        "You are converting legacy Java 11 code into Spring Boot 3.x services.\n"
+        "You will receive:\n"
+        "- class_doc: structured documentation of a single class.\n"
+        "- supporting_source_chunks: relevant raw legacy code snippets.\n"
+        "You must output ONE complete Java file that:\n"
+        "- Compiles with Java 11 and Spring Boot (no syntax errors).\n"
+        "- Uses the standard layered architecture: controller/service/repository where appropriate.\n"
+        "- Fully implements methods based on the described behaviour (no TODOs).\n"
+        "- Uses dependency injection and @Service/@Component annotations.\n"
+        "Return only the Java code as a string field in JSON:\n"
+        "{'file_name': str, 'package': str, 'code': str}"
+    )
+
+def _most_relevant_chunks_for_class(class_name: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    # Simple cosine on embeddings; here we do a naive score using exact class name match
+    db = load_chunk_db()
+    # favour chunks that reference the class name
+    filtered = [c for c in db if class_name in c.get("classes", [])]
+    return filtered[:top_k]
+
+def generate_spring_for_class(
+    file_doc: Dict[str, Any],
+    class_name: str,
+    base_package: str = "com.bank.cheque",
+) -> Path:
+    clazz = next(c for c in file_doc["classes"] if c["name"] == class_name)
+
+    chunks = _most_relevant_chunks_for_class(class_name)
+    payload = {
+        "target_architecture": {
+            "base_package": base_package,
+            "suggested_layer": "service",  # you can infer from clazz['role']
+        },
+        "class_doc": clazz,
+        "supporting_source_chunks": [
+            {"id": c["id"], "source": f"// lines {c['start_line']}-{c['end_line']}\n{''}"}
+            for c in chunks
+        ],
+    }
+
+    resp = chat_json(_spring_system_prompt(), payload, max_tokens=2500)
+    code = resp["code"]
+    package_name = resp.get("package", f"{base_package}.service")
+    file_name = resp.get("file_name", f"{class_name}Service.java")
+
+    # map package → folder path
+    rel_dir = Path(*package_name.split("."))
+    out_dir = GENERATED_SRC_DIR / rel_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / file_name
+    out_path.write_text(code, encoding="utf-8")
+    return out_path
+
+======≈========================================================================================
+
+8. Test generator – backend/test_generator.py
+
+# backend/test_generator.py
+from __future__ import annotations
+from pathlib import Path
+from typing import Dict, Any
+
+from .config import GENERATED_TEST_DIR
+from .llm_client import chat_json
+
+def _test_system_prompt() -> str:
+    return (
+        "You generate JUnit 5 tests for Spring Boot services.\n"
+        "Input:\n"
+        "- spring_code: the full Java file of a service or controller.\n"
+        "- class_doc: structured documentation of the class.\n"
+        "You must output a Java test class that:\n"
+        "- Uses JUnit 5 (@Test) and Mockito where useful.\n"
+        "- Covers main happy paths, negative cases and edge cases derived from documentation.\n"
+        "Return JSON: {'file_name': str, 'code': str}"
+    )
+
+def generate_tests_for_spring_class(
+    spring_file: Path,
+    class_doc: Dict[str, Any],
+    base_package: str = "com.bank.cheque",
+) -> Path:
+    spring_code = spring_file.read_text(encoding="utf-8")
+    payload = {
+        "spring_code": spring_code,
+        "class_doc": class_doc,
+    }
+    resp = chat_json(_test_system_prompt(), payload, max_tokens=2500)
+    code = resp["code"]
+    file_name = resp.get("file_name", spring_file.stem + "Test.java")
+
+    # simple mapping: put tests in same package with `.test` suffix
+    # (you can refine this to mirror src/main/java)
+    rel_dir = Path(*base_package.split(".")) / "service"
+    out_dir = GENERATED_TEST_DIR / rel_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / file_name
+    out_path.write_text(code, encoding="utf-8")
+    return out_path
+
+=========================================================================================
+
+9. Orchestrator – backend/pipeline.py
+
+# backend/pipeline.py
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import Dict, Any
+
+from .config import (
+    AST_JSON_PATH,
+    DEFAULT_LEGACY_REPO,
+    PREPROCESSED_JSON,
+)
+from .ast_extractor import run_java_extractor, load_ast
+from .doc_generator import generate_documentation_for_file
+from .converter import generate_spring_for_class
+from .test_generator import generate_tests_for_spring_class
+
+def _load_preprocessed() -> Dict[str, Any]:
+    if not PREPROCESSED_JSON.exists():
+        return {}
+    return json.loads(PREPROCESSED_JSON.read_text(encoding="utf-8"))
+
+def _save_preprocessed(data: Dict[str, Any]) -> None:
+    PREPROCESSED_JSON.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def ensure_ast(repo: Path = DEFAULT_LEGACY_REPO) -> Dict[str, Any]:
+    if not AST_JSON_PATH.exists():
+        return run_java_extractor(repo, AST_JSON_PATH)
+    return load_ast(AST_JSON_PATH)
+
+def generate_docs(file_name: str, repo: Path = DEFAULT_LEGACY_REPO) -> Dict[str, Any]:
+    ast = ensure_ast(repo)
+    file_path = repo / file_name
+    file_doc = generate_documentation_for_file(ast, file_path)
+
+    meta = _load_preprocessed()
+    fmeta = meta.setdefault(file_name, {})
+    fmeta["doc_status"] = "generated"
+    _save_preprocessed(meta)
+    return file_doc
+
+def convert_class_to_spring(file_name: str, class_name: str, repo: Path = DEFAULT_LEGACY_REPO):
+    from .doc_generator import DOCS_DIR
+    ast = ensure_ast(repo)
+    doc_path = DOCS_DIR / f"{Path(file_name).stem}.json"
+    if not doc_path.exists():
+        raise RuntimeError("Documentation not found; generate docs first.")
+    file_doc = json.loads(doc_path.read_text(encoding="utf-8"))
+
+    spring_path = generate_spring_for_class(file_doc, class_name)
+
+    meta = _load_preprocessed()
+    fmeta = meta.setdefault(file_name, {})
+    classes_meta = fmeta.setdefault("classes", {})
+    cmeta = classes_meta.setdefault(class_name, {})
+    cmeta["spring_path"] = str(spring_path)
+    cmeta["spring_status"] = "generated"
+    _save_preprocessed(meta)
+
+    return spring_path
+
+def generate_tests(file_name: str, class_name: str, repo: Path = DEFAULT_LEGACY_REPO):
+    from .doc_generator import DOCS_DIR
+    doc_path = DOCS_DIR / f"{Path(file_name).stem}.json"
+    file_doc = json.loads(doc_path.read_text(encoding="utf-8"))
+    clazz = next(c for c in file_doc["classes"] if c["name"] == class_name)
+
+    meta = _load_preprocessed()
+    cmeta = meta[file_name]["classes"][class_name]
+    spring_path = Path(cmeta["spring_path"])
+
+    test_path = generate_tests_for_spring_class(spring_path, clazz)
+
+    cmeta["test_path"] = str(test_path)
+    cmeta["test_status"] = "generated"
+    _save_preprocessed(meta)
+    return test_path
+
+================================================================================
+
